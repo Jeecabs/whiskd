@@ -2,9 +2,10 @@
 
 const { spawn } = require("child_process");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
-const ROO_DIR = path.join(process.cwd(), ".roo");
+const ROO_DIR = path.join("/tmp", "roo", process.cwd());
 
 const stripAnsi = (str) =>
   str.replace(
@@ -246,9 +247,9 @@ else if (sub === "clean") {
     }
   }
   if (cleaned === 0) console.log("nothing to clean");
-  // Remove .roo if empty
+  // Remove ROO_DIR if empty
   if (fs.existsSync(ROO_DIR) && fs.readdirSync(ROO_DIR).length === 0) {
-    fs.rmdirSync(ROO_DIR);
+    fs.rmSync(ROO_DIR, { recursive: true, force: true });
   }
   process.exit(0);
 }
