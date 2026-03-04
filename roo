@@ -5,13 +5,74 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const ROO_DIR = path.join("/tmp", "roo", process.cwd());
+const ROO_BASE = path.join("/tmp", "roo");
+const ROO_DIR = path.join(ROO_BASE, process.cwd());
+
+const MAX_LOG_BYTES = 10 * 1024 * 1024; // 10 MB
+const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 const stripAnsi = (str) =>
   str.replace(
     /[\u001b\u009b]\[[0-9;]*[a-zA-Z]|\u001b\].*?(?:\u0007|\u001b\\)/g,
     ""
   );
+
+// ── Housekeeping ──
+
+function housekeep() {
+  if (!fs.existsSync(ROO_BASE)) return;
+  const now = Date.now();
+  pruneOldDirs(ROO_BASE, now);
+}
+
+function pruneOldDirs(dir, now) {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const ent of entries) {
+    const full = path.join(dir, ent.name);
+    if (!ent.isDirectory()) continue;
+    // If this dir has a "cmd" file, it's a process dir — check age
+    const cmd = path.join(full, "cmd");
+    if (fs.existsSync(cmd)) {
+      try {
+        const mtime = fs.statSync(cmd).mtimeMs;
+        if (now - mtime > MAX_AGE_MS) {
+          // Don't remove if still running
+          const pf = path.join(full, "pid");
+          if (fs.existsSync(pf)) {
+            const pid = parseInt(fs.readFileSync(pf, "utf8").trim());
+            try { process.kill(pid, 0); continue; } catch {}
+          }
+          fs.rmSync(full, { recursive: true, force: true });
+        }
+      } catch {}
+    } else {
+      // Recurse into intermediate path directories
+      pruneOldDirs(full, now);
+      // Remove empty intermediate dirs
+      try {
+        if (fs.readdirSync(full).length === 0) fs.rmdirSync(full);
+      } catch {}
+    }
+  }
+}
+
+function truncateLog(logPath) {
+  try {
+    const stat = fs.statSync(logPath);
+    if (stat.size <= MAX_LOG_BYTES) return;
+    const buf = Buffer.alloc(MAX_LOG_BYTES / 2);
+    const fd = fs.openSync(logPath, "r");
+    fs.readSync(fd, buf, 0, buf.length, stat.size - buf.length);
+    fs.closeSync(fd);
+    const text = buf.toString();
+    const firstNewline = text.indexOf("\n");
+    const kept = firstNewline >= 0 ? text.slice(firstNewline + 1) : text;
+    fs.writeFileSync(logPath, `[roo] log truncated (exceeded ${MAX_LOG_BYTES / 1024 / 1024}MB)\n` + kept);
+  } catch {}
+}
+
+housekeep();
 
 // ── Naming ──
 
@@ -395,6 +456,7 @@ else if (sub === "start") {
 
   child.on("close", (code) => {
     fs.appendFileSync(log, `\n[roo:${name}] exited with code ${code}\n`);
+    truncateLog(log);
     try { fs.unlinkSync(pidFile(name)); } catch {}
   });
 
@@ -412,9 +474,20 @@ else {
   const log = logFile(name);
   const logStream = fs.createWriteStream(log, { flags: "w" });
   const now = new Date().toISOString();
-  logStream.write(`[roo:${name}] started: ${cmd.join(" ")}\n`);
-  logStream.write(`[roo:${name}] time: ${now}\n`);
-  logStream.write(`[roo:${name}] ${"—".repeat(60)}\n`);
+  let logBytes = 0;
+  const writeLog = (str) => {
+    if (logBytes > MAX_LOG_BYTES) return;
+    logStream.write(str);
+    logBytes += Buffer.byteLength(str);
+    if (logBytes > MAX_LOG_BYTES) {
+      logStream.end();
+      truncateLog(log);
+      // Reopen in append mode for any final messages
+    }
+  };
+  writeLog(`[roo:${name}] started: ${cmd.join(" ")}\n`);
+  writeLog(`[roo:${name}] time: ${now}\n`);
+  writeLog(`[roo:${name}] ${"—".repeat(60)}\n`);
 
   const child = spawn(cmd[0], cmd.slice(1), {
     stdio: ["ignore", "pipe", "pipe"],
@@ -434,13 +507,13 @@ else {
 
   child.stdout.on("data", (data) => {
     process.stdout.write(data);
-    logStream.write(stripAnsi(data.toString()));
+    writeLog(stripAnsi(data.toString()));
     drawBar(barText);
   });
 
   child.stderr.on("data", (data) => {
     process.stdout.write(data);
-    logStream.write(stripAnsi(data.toString()));
+    writeLog(stripAnsi(data.toString()));
     drawBar(barText);
   });
 
