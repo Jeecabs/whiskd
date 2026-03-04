@@ -1,0 +1,517 @@
+#!/usr/bin/env node
+
+const { spawn } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+
+const ROO_DIR = path.join(process.cwd(), ".roo");
+
+const stripAnsi = (str) =>
+  str.replace(
+    /[\u001b\u009b]\[[0-9;]*[a-zA-Z]|\u001b\].*?(?:\u0007|\u001b\\)/g,
+    ""
+  );
+
+// ── Naming ──
+
+function deriveName(cmdArgs) {
+  const full = cmdArgs.join(" ");
+  // npm run <x> / yarn <x> / pnpm <x> → use the script name
+  const npmMatch = full.match(/(?:npm run|yarn|pnpm(?:\s+run)?)\s+(\S+)/);
+  if (npmMatch) return sanitize(npmMatch[1]);
+  // node/python/ruby <file> → use filename without extension
+  const fileMatch = full.match(/(?:node|python|ruby|bun|deno|go run)\s+(\S+)/);
+  if (fileMatch) return sanitize(path.basename(fileMatch[1], path.extname(fileMatch[1])));
+  // fallback: first arg that looks like a command (not a flag or single char)
+  for (const w of cmdArgs) {
+    if (!w.startsWith("-") && w.length > 1 && !/^[A-Z_]+=/.test(w)) {
+      return sanitize(path.basename(w, path.extname(w)));
+    }
+  }
+  return `proc-${Date.now().toString(36).slice(-4)}`;
+}
+
+function sanitize(name) {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "-").toLowerCase().slice(0, 30);
+}
+
+// ── Process helpers ──
+
+function procDir(name) { return path.join(ROO_DIR, name); }
+function logFile(name) { return path.join(procDir(name), "output.log"); }
+function pidFile(name) { return path.join(procDir(name), "pid"); }
+function cmdFile(name) { return path.join(procDir(name), "cmd"); }
+function startedFile(name) { return path.join(procDir(name), "started"); }
+
+function ensureProc(name) {
+  const d = procDir(name);
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+}
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function getPid(name) {
+  const f = pidFile(name);
+  if (!fs.existsSync(f)) return null;
+  const pid = parseInt(fs.readFileSync(f, "utf8").trim());
+  return pidAlive(pid) ? pid : null;
+}
+
+function getCmd(name) {
+  const f = cmdFile(name);
+  return fs.existsSync(f) ? fs.readFileSync(f, "utf8").trim() : "?";
+}
+
+function getStarted(name) {
+  const f = startedFile(name);
+  return fs.existsSync(f) ? fs.readFileSync(f, "utf8").trim() : "?";
+}
+
+function allProcs() {
+  if (!fs.existsSync(ROO_DIR)) return [];
+  return fs.readdirSync(ROO_DIR).filter((d) => {
+    const full = path.join(ROO_DIR, d);
+    return fs.statSync(full).isDirectory() && fs.existsSync(path.join(full, "cmd"));
+  });
+}
+
+// Find a unique name if collision
+function uniqueName(base) {
+  if (!fs.existsSync(procDir(base)) || !getPid(base)) return base;
+  for (let i = 2; i <= 99; i++) {
+    const n = `${base}-${i}`;
+    if (!fs.existsSync(procDir(n)) || !getPid(n)) return n;
+  }
+  return `${base}-${Date.now().toString(36).slice(-4)}`;
+}
+
+// ── Parse --name flag from args, return { name, rest } ──
+
+function parseNameFlag(args) {
+  for (let i = 0; i < args.length; i++) {
+    if ((args[i] === "--name" || args[i] === "-n") && args[i + 1]) {
+      const name = sanitize(args[i + 1]);
+      const rest = [...args.slice(0, i), ...args.slice(i + 2)];
+      return { name, rest };
+    }
+  }
+  return { name: null, rest: args };
+}
+
+// ── TUI helpers ──
+
+function drawBar(text) {
+  const rows = process.stdout.rows || 24;
+  const cols = process.stdout.columns || 80;
+  process.stdout.write("\x1b7");
+  process.stdout.write(`\x1b[${rows};1H`);
+  process.stdout.write("\x1b[2K");
+  process.stdout.write(`\x1b[7m ${text.padEnd(cols - 1)}\x1b[0m`);
+  process.stdout.write("\x1b8");
+}
+
+function setupScrollRegion() {
+  const rows = process.stdout.rows || 24;
+  process.stdout.write(`\x1b[1;${rows - 1}r`);
+  process.stdout.write(`\x1b[${rows - 1};1H`);
+}
+
+function resetTerminal() {
+  const rows = process.stdout.rows || 24;
+  process.stdout.write(`\x1b[1;${rows}r`);
+  process.stdout.write(`\x1b[${rows};1H\x1b[2K`);
+}
+
+// ── Resolve name: explicit arg, or pick the only running one, or error ──
+
+function resolveName(explicit) {
+  if (explicit && !["--help", "-h"].includes(explicit)) return explicit;
+  const procs = allProcs();
+  const running = procs.filter((n) => getPid(n));
+  if (running.length === 1) return running[0];
+  if (running.length === 0) {
+    // pick the most recent stopped one for logs
+    if (procs.length === 1) return procs[0];
+    if (procs.length === 0) return null;
+    console.error("multiple processes found. specify a name:");
+    procs.forEach((n) => console.error(`  ${n}`));
+    process.exit(1);
+  }
+  console.error("multiple running processes. specify a name:");
+  running.forEach((n) => console.error(`  ${n}  (pid ${getPid(n)})`));
+  process.exit(1);
+}
+
+// ── Commands ──
+
+const sub = process.argv[2];
+
+if (!sub || sub === "--help" || sub === "-h") {
+  console.log(`roo - lightweight process wrapper with TUI
+
+  roo <cmd...>                  run with TUI, auto-named
+  roo start <cmd...>            run in background, auto-named
+  roo start --name api <cmd>    run in background with explicit name
+  roo status                    list all processes (LLM-friendly)
+  roo logs [name] [n]           last n lines (default 40)
+  roo attach [name]             attach TUI to running process
+  roo stop [name]               stop a process (or all with --all)
+  roo clean                     remove stopped process dirs
+
+TUI keys:
+  q/Ctrl+C  kill process and exit (default)
+  d         detach (leave process running in background)
+
+Names are auto-derived from commands:
+  npm run dev → dev    node server.js → server
+  npm run build → build    python app.py → app
+
+Multiple processes per directory:
+  roo start npm run dev        → .roo/dev/output.log
+  roo start npm run build      → .roo/build/output.log
+  roo start --name api npm run start → .roo/api/output.log`);
+  process.exit(0);
+}
+
+// ── status ──
+if (sub === "status") {
+  const procs = allProcs();
+  if (procs.length === 0) {
+    console.log("no processes");
+    process.exit(0);
+  }
+  for (const name of procs) {
+    const pid = getPid(name);
+    const cmd = getCmd(name);
+    const started = getStarted(name);
+    const status = pid ? "running" : "stopped";
+    const log = logFile(name);
+    console.log(`process  name=${name}  status=${status}  pid=${pid || "—"}  started=${started}  cmd="${cmd}"  log=${log}`);
+  }
+  process.exit(0);
+}
+
+// ── stop ──
+if (sub === "stop") {
+  const arg = process.argv[3];
+
+  if (arg === "--all") {
+    const procs = allProcs();
+    let stopped = 0;
+    for (const name of procs) {
+      const pid = getPid(name);
+      if (pid) {
+        process.kill(pid, "SIGTERM");
+        console.log(`stopped  ${name}  pid=${pid}`);
+        stopped++;
+      }
+    }
+    if (stopped === 0) console.log("nothing running");
+    setTimeout(() => {
+      for (const name of procs) {
+        try { fs.unlinkSync(pidFile(name)); } catch {}
+      }
+      process.exit(0);
+    }, 1500);
+    return;
+  }
+
+  const name = resolveName(arg);
+  if (!name) { console.log("nothing running"); process.exit(0); }
+  const pid = getPid(name);
+  if (!pid) { console.log(`${name}: not running`); process.exit(0); }
+  process.kill(pid, "SIGTERM");
+  console.log(`stopped  ${name}  pid=${pid}`);
+  setTimeout(() => {
+    if (getPid(name)) {
+      process.kill(pid, "SIGKILL");
+      console.log(`force killed ${name}`);
+    }
+    try { fs.unlinkSync(pidFile(name)); } catch {}
+    process.exit(0);
+  }, 1500);
+}
+
+// ── clean ──
+else if (sub === "clean") {
+  const procs = allProcs();
+  let cleaned = 0;
+  for (const name of procs) {
+    if (!getPid(name)) {
+      fs.rmSync(procDir(name), { recursive: true, force: true });
+      console.log(`removed  ${name}`);
+      cleaned++;
+    }
+  }
+  if (cleaned === 0) console.log("nothing to clean");
+  // Remove .roo if empty
+  if (fs.existsSync(ROO_DIR) && fs.readdirSync(ROO_DIR).length === 0) {
+    fs.rmdirSync(ROO_DIR);
+  }
+  process.exit(0);
+}
+
+// ── logs ──
+else if (sub === "logs") {
+  // roo logs [name] [n]  — name is optional if only one proc
+  let name = null;
+  let n = 40;
+  const args = process.argv.slice(3);
+  for (const a of args) {
+    if (/^\d+$/.test(a)) n = parseInt(a);
+    else name = a;
+  }
+  name = resolveName(name);
+  if (!name) { console.log("no processes"); process.exit(0); }
+  const log = logFile(name);
+  if (!fs.existsSync(log)) { console.log(`${name}: no logs yet`); process.exit(0); }
+  const lines = fs.readFileSync(log, "utf8").split("\n");
+  console.log(lines.slice(Math.max(0, lines.length - n)).join("\n"));
+  process.exit(0);
+}
+
+// ── attach ──
+else if (sub === "attach") {
+  const name = resolveName(process.argv[3]);
+  if (!name) { console.log("nothing to attach to"); process.exit(0); }
+  const pid = getPid(name);
+  if (!pid) { console.log(`${name}: not running`); process.exit(0); }
+  const log = logFile(name);
+  if (!fs.existsSync(log)) { console.log("no log file"); process.exit(1); }
+
+  setupScrollRegion();
+
+  const existing = fs.readFileSync(log, "utf8");
+  const rows = process.stdout.rows || 24;
+  const recentLines = existing.split("\n").slice(-(rows - 5));
+  for (const line of recentLines) process.stdout.write(line + "\n");
+
+  const barText = `${name}  │  ${getCmd(name)}  │  pid ${pid}  │  q/Ctrl+C: quit+kill  d: detach`;
+  drawBar(barText);
+
+  let filePos = fs.statSync(log).size;
+  const poll = setInterval(() => {
+    try {
+      const stat = fs.statSync(log);
+      if (stat.size > filePos) {
+        const fd = fs.openSync(log, "r");
+        const buf = Buffer.alloc(stat.size - filePos);
+        fs.readSync(fd, buf, 0, buf.length, filePos);
+        fs.closeSync(fd);
+        filePos = stat.size;
+        process.stdout.write(buf.toString());
+        drawBar(barText);
+      }
+    } catch {}
+  }, 100);
+
+  const statusPoll = setInterval(() => {
+    if (!getPid(name)) {
+      clearInterval(poll);
+      clearInterval(statusPoll);
+      resetTerminal();
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+      console.log(`\n[roo:${name}] process exited`);
+      process.exit(0);
+    }
+  }, 1000);
+
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on("data", (key) => {
+      if (key[0] === 0x71 || key[0] === 0x03) {
+        // q or Ctrl+C = kill + exit
+        clearInterval(poll);
+        clearInterval(statusPoll);
+        resetTerminal();
+        process.stdin.setRawMode(false);
+        try { process.kill(-pid, "SIGTERM"); } catch {}
+        try { process.kill(pid, "SIGTERM"); } catch {}
+        try { fs.unlinkSync(pidFile(name)); } catch {}
+        // force kill after 2s if still alive
+        setTimeout(() => {
+          try { process.kill(-pid, "SIGKILL"); } catch {}
+          try { process.kill(pid, "SIGKILL"); } catch {}
+        }, 2000);
+        console.log(`\n[roo:${name}] killed`);
+        process.exit(0);
+      }
+      if (key[0] === 0x64) {
+        // d = detach (leave running)
+        clearInterval(poll);
+        clearInterval(statusPoll);
+        resetTerminal();
+        process.stdin.setRawMode(false);
+        console.log(`\n[roo:${name}] detached. still running.`);
+        process.exit(0);
+      }
+    });
+  }
+
+  process.stdout.on("resize", () => {
+    setupScrollRegion();
+    drawBar(barText);
+  });
+}
+
+// ── start (background) ──
+else if (sub === "start") {
+  const { name: explicitName, rest } = parseNameFlag(process.argv.slice(3));
+  if (rest.length === 0) {
+    console.error("usage: roo start [--name <n>] <command...>");
+    process.exit(1);
+  }
+  const baseName = explicitName || deriveName(rest);
+  const name = uniqueName(baseName);
+  ensureProc(name);
+
+  const log = logFile(name);
+  const logFd = fs.openSync(log, "w");
+  const now = new Date().toISOString();
+  const header = `[roo:${name}] started: ${rest.join(" ")}\n[roo:${name}] time: ${now}\n[roo:${name}] ${"—".repeat(60)}\n`;
+  fs.writeSync(logFd, header);
+
+  const child = spawn(rest[0], rest.slice(1), {
+    stdio: ["ignore", logFd, logFd],
+    shell: true,
+    detached: true,
+    env: { ...process.env, FORCE_COLOR: "0" },
+  });
+
+  fs.writeFileSync(pidFile(name), String(child.pid));
+  fs.writeFileSync(cmdFile(name), rest.join(" "));
+  fs.writeFileSync(startedFile(name), now);
+  child.unref();
+
+  console.log(`started  name=${name}  pid=${child.pid}`);
+  console.log(`logs     ${log}`);
+  console.log(`\n  roo attach ${name}`);
+  console.log(`  roo logs ${name}`);
+  console.log(`  roo stop ${name}`);
+
+  child.on("close", (code) => {
+    fs.appendFileSync(log, `\n[roo:${name}] exited with code ${code}\n`);
+    try { fs.unlinkSync(pidFile(name)); } catch {}
+  });
+
+  setTimeout(() => process.exit(0), 300);
+}
+
+// ── default: foreground TUI ──
+else {
+  const { name: explicitName, rest } = parseNameFlag(process.argv.slice(2));
+  const cmd = rest;
+  const baseName = explicitName || deriveName(cmd);
+  const name = uniqueName(baseName);
+  ensureProc(name);
+
+  const log = logFile(name);
+  const logStream = fs.createWriteStream(log, { flags: "w" });
+  const now = new Date().toISOString();
+  logStream.write(`[roo:${name}] started: ${cmd.join(" ")}\n`);
+  logStream.write(`[roo:${name}] time: ${now}\n`);
+  logStream.write(`[roo:${name}] ${"—".repeat(60)}\n`);
+
+  const child = spawn(cmd[0], cmd.slice(1), {
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: true,
+    detached: true,
+    env: { ...process.env, FORCE_COLOR: "1" },
+  });
+
+  fs.writeFileSync(pidFile(name), String(child.pid));
+  fs.writeFileSync(cmdFile(name), cmd.join(" "));
+  fs.writeFileSync(startedFile(name), now);
+
+  setupScrollRegion();
+
+  const barText = `${name}  │  ${cmd.join(" ")}  │  pid ${child.pid}  │  q/Ctrl+C: quit+kill  d: detach`;
+  drawBar(barText);
+
+  child.stdout.on("data", (data) => {
+    process.stdout.write(data);
+    logStream.write(stripAnsi(data.toString()));
+    drawBar(barText);
+  });
+
+  child.stderr.on("data", (data) => {
+    process.stdout.write(data);
+    logStream.write(stripAnsi(data.toString()));
+    drawBar(barText);
+  });
+
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    let killing = false;
+    process.stdin.on("data", (key) => {
+      if (key[0] === 0x71 || key[0] === 0x03) {
+        // q or Ctrl+C = kill + exit
+        if (!killing) {
+          killing = true;
+          try { process.kill(-child.pid, "SIGTERM"); } catch {}
+          child.kill("SIGTERM");
+          // force kill + exit if SIGTERM doesn't work after 2s
+          setTimeout(() => {
+            try { process.kill(-child.pid, "SIGKILL"); } catch {}
+            try { child.kill("SIGKILL"); } catch {}
+            resetTerminal();
+            process.stdin.setRawMode(false);
+            try { fs.unlinkSync(pidFile(name)); } catch {}
+            logStream.end();
+            console.log(`\n[roo:${name}] force killed`);
+            process.exit(1);
+          }, 2000);
+        } else {
+          // second press = force kill immediately
+          try { process.kill(-child.pid, "SIGKILL"); } catch {}
+          try { child.kill("SIGKILL"); } catch {}
+          resetTerminal();
+          process.stdin.setRawMode(false);
+          try { fs.unlinkSync(pidFile(name)); } catch {}
+          logStream.end();
+          console.log(`\n[roo:${name}] force killed`);
+          process.exit(1);
+        }
+      }
+      if (key[0] === 0x64) {
+        // d = detach (leave running)
+        resetTerminal();
+        process.stdin.setRawMode(false);
+        child.unref();
+        logStream.end();
+        console.log(`\n[roo:${name}] detached. still running.`);
+        console.log(`  roo attach ${name}`);
+        console.log(`  roo logs ${name}`);
+        console.log(`  roo stop ${name}`);
+        process.exit(0);
+      }
+    });
+  }
+
+  child.on("close", (code) => {
+    resetTerminal();
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    logStream.write(`\n[roo:${name}] exited with code ${code}\n`);
+    try { fs.unlinkSync(pidFile(name)); } catch {}
+    logStream.end();
+    console.log(`\n[roo:${name}] exited with code ${code}`);
+    process.exit(code ?? 1);
+  });
+
+  child.on("error", (err) => {
+    resetTerminal();
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    console.error(`[roo:${name}] failed: ${err.message}`);
+    logStream.end();
+    process.exit(1);
+  });
+
+  process.stdout.on("resize", () => {
+    setupScrollRegion();
+    drawBar(barText);
+  });
+}
