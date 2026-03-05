@@ -164,6 +164,15 @@ function parseNameFlag(args) {
 
 // ── TUI helpers ──
 
+function formatUptime(startTime) {
+  const s = Math.floor((Date.now() - startTime) / 1000);
+  if (s < 60) return `up ${s}s`;
+  if (s < 3600) return `up ${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return `up ${h}h${String(m).padStart(2, "0")}m`;
+}
+
 function drawBar(text) {
   const rows = process.stdout.rows || 24;
   const cols = process.stdout.columns || 80;
@@ -216,7 +225,7 @@ if (!sub || sub === "--help" || sub === "-h") {
   roo <cmd...>                  run with TUI, auto-named
   roo start <cmd...>            run in background, auto-named
   roo start --name api <cmd>    run in background with explicit name
-  roo status                    list all processes (LLM-friendly)
+  roo status [--json]            list all processes (--json for machine-readable)
   roo logs [name] [n]           last n lines (default 40)
   roo attach [name]             attach TUI to running process
   roo stop [name]               stop a process (or all with --all)
@@ -225,6 +234,7 @@ if (!sub || sub === "--help" || sub === "-h") {
 TUI keys:
   q/Ctrl+C  kill process and exit (default)
   d         detach (leave process running in background)
+  p         pause/unpause output
 
 Names are auto-derived from commands:
   npm run dev → dev    node server.js → server
@@ -239,7 +249,26 @@ Multiple processes per directory:
 
 // ── status ──
 if (sub === "status") {
+  const jsonFlag = process.argv.includes("--json");
   const procs = allProcs();
+  if (jsonFlag) {
+    const result = procs.map((name) => {
+      const pid = getPid(name);
+      const started = getStarted(name);
+      const startMs = started !== "?" ? new Date(started).getTime() : null;
+      return {
+        name,
+        status: pid ? "running" : "stopped",
+        pid: pid || null,
+        started,
+        cmd: getCmd(name),
+        log: logFile(name),
+        uptime: pid && startMs ? formatUptime(startMs) : null,
+      };
+    });
+    console.log(JSON.stringify(result, null, 2));
+    process.exit(0);
+  }
   if (procs.length === 0) {
     console.log("no processes");
     process.exit(0);
@@ -350,8 +379,15 @@ else if (sub === "attach") {
   const recentLines = existing.split("\n").slice(-(rows - 5));
   for (const line of recentLines) process.stdout.write(line + "\n");
 
-  const barText = `${name}  │  ${getCmd(name)}  │  pid ${pid}  │  q/Ctrl+C: quit+kill  d: detach`;
-  drawBar(barText);
+  const attachStartTime = new Date(getStarted(name)).getTime();
+  let attachPaused = false;
+  let attachPauseBuf = [];
+
+  function attachBarText() {
+    const pause = attachPaused ? "  [PAUSED]" : "";
+    return `${name}  │  ${getCmd(name)}  │  pid ${pid}  │  ${formatUptime(attachStartTime)}${pause}  │  q/Ctrl+C: quit+kill  d: detach  p: pause`;
+  }
+  drawBar(attachBarText());
 
   let filePos = fs.statSync(log).size;
   const poll = setInterval(() => {
@@ -363,16 +399,24 @@ else if (sub === "attach") {
         fs.readSync(fd, buf, 0, buf.length, filePos);
         fs.closeSync(fd);
         filePos = stat.size;
-        process.stdout.write(buf.toString());
-        drawBar(barText);
+        const data = buf.toString();
+        if (attachPaused) {
+          attachPauseBuf.push(data);
+        } else {
+          process.stdout.write(data);
+        }
+        drawBar(attachBarText());
       }
     } catch {}
   }, 100);
+
+  const barTick = setInterval(() => drawBar(attachBarText()), 1000);
 
   const statusPoll = setInterval(() => {
     if (!getPid(name)) {
       clearInterval(poll);
       clearInterval(statusPoll);
+      clearInterval(barTick);
       resetTerminal();
       if (process.stdin.isTTY) process.stdin.setRawMode(false);
       console.log(`\n[roo:${name}] process exited`);
@@ -388,6 +432,7 @@ else if (sub === "attach") {
         // q or Ctrl+C = kill + exit
         clearInterval(poll);
         clearInterval(statusPoll);
+        clearInterval(barTick);
         resetTerminal();
         process.stdin.setRawMode(false);
         try { process.kill(-pid, "SIGTERM"); } catch {}
@@ -405,17 +450,27 @@ else if (sub === "attach") {
         // d = detach (leave running)
         clearInterval(poll);
         clearInterval(statusPoll);
+        clearInterval(barTick);
         resetTerminal();
         process.stdin.setRawMode(false);
         console.log(`\n[roo:${name}] detached. still running.`);
         process.exit(0);
+      }
+      if (key[0] === 0x70) {
+        // p = toggle pause
+        attachPaused = !attachPaused;
+        if (!attachPaused && attachPauseBuf.length > 0) {
+          process.stdout.write(attachPauseBuf.join(""));
+          attachPauseBuf = [];
+        }
+        drawBar(attachBarText());
       }
     });
   }
 
   process.stdout.on("resize", () => {
     setupScrollRegion();
-    drawBar(barText);
+    drawBar(attachBarText());
   });
 }
 
@@ -502,19 +557,36 @@ else {
 
   setupScrollRegion();
 
-  const barText = `${name}  │  ${cmd.join(" ")}  │  pid ${child.pid}  │  q/Ctrl+C: quit+kill  d: detach`;
-  drawBar(barText);
+  const fgStartTime = Date.now();
+  let fgPaused = false;
+  let fgPauseBuf = [];
+
+  function fgBarText() {
+    const pause = fgPaused ? "  [PAUSED]" : "";
+    return `${name}  │  ${cmd.join(" ")}  │  pid ${child.pid}  │  ${formatUptime(fgStartTime)}${pause}  │  q/Ctrl+C: quit+kill  d: detach  p: pause`;
+  }
+  drawBar(fgBarText());
+
+  const fgBarTick = setInterval(() => drawBar(fgBarText()), 1000);
 
   child.stdout.on("data", (data) => {
-    process.stdout.write(data);
+    if (fgPaused) {
+      fgPauseBuf.push(data);
+    } else {
+      process.stdout.write(data);
+    }
     writeLog(stripAnsi(data.toString()));
-    drawBar(barText);
+    drawBar(fgBarText());
   });
 
   child.stderr.on("data", (data) => {
-    process.stdout.write(data);
+    if (fgPaused) {
+      fgPauseBuf.push(Buffer.from(`\x1b[2;31m${data}\x1b[0m`));
+    } else {
+      process.stdout.write(`\x1b[2;31m${data}\x1b[0m`);
+    }
     writeLog(stripAnsi(data.toString()));
-    drawBar(barText);
+    drawBar(fgBarText());
   });
 
   if (process.stdin.isTTY) {
@@ -524,6 +596,7 @@ else {
     process.stdin.on("data", (key) => {
       if (key[0] === 0x71 || key[0] === 0x03) {
         // q or Ctrl+C = kill + exit
+        clearInterval(fgBarTick);
         if (!killing) {
           killing = true;
           try { process.kill(-child.pid, "SIGTERM"); } catch {}
@@ -553,6 +626,7 @@ else {
       }
       if (key[0] === 0x64) {
         // d = detach (leave running)
+        clearInterval(fgBarTick);
         resetTerminal();
         process.stdin.setRawMode(false);
         child.unref();
@@ -563,10 +637,20 @@ else {
         console.log(`  roo stop ${name}`);
         process.exit(0);
       }
+      if (key[0] === 0x70) {
+        // p = toggle pause
+        fgPaused = !fgPaused;
+        if (!fgPaused && fgPauseBuf.length > 0) {
+          for (const chunk of fgPauseBuf) process.stdout.write(chunk);
+          fgPauseBuf = [];
+        }
+        drawBar(fgBarText());
+      }
     });
   }
 
   child.on("close", (code) => {
+    clearInterval(fgBarTick);
     resetTerminal();
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     logStream.write(`\n[roo:${name}] exited with code ${code}\n`);
@@ -577,6 +661,7 @@ else {
   });
 
   child.on("error", (err) => {
+    clearInterval(fgBarTick);
     resetTerminal();
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     console.error(`[roo:${name}] failed: ${err.message}`);
@@ -586,6 +671,6 @@ else {
 
   process.stdout.on("resize", () => {
     setupScrollRegion();
-    drawBar(barText);
+    drawBar(fgBarText());
   });
 }
