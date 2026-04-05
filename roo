@@ -616,6 +616,15 @@ else if (sub === "top") {
     process.stdout.write("\x1b[2K\n");
 
     const availRows = rows - 4;
+    if (procList.length === 0) {
+      const msg = "no processes -- roo start <cmd> to begin";
+      const pad = Math.max(0, Math.floor((availRows - 1) / 2));
+      for (let i = 0; i < availRows; i++) {
+        process.stdout.write("\x1b[2K");
+        if (i === pad) process.stdout.write("\x1b[2m" + msg.padStart(Math.floor((cols + msg.length) / 2)) + "\x1b[0m");
+        process.stdout.write("\n");
+      }
+    } else
     for (let i = 0; i < availRows; i++) {
       process.stdout.write("\x1b[2K");
       if (i < procList.length) {
