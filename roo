@@ -276,7 +276,7 @@ function resolveName(explicit) {
 
 // ── Attach (reusable) ──
 
-function runAttach(proc, onReturn) {
+function runAttach(proc, onReturn, { safeQuit = false } = {}) {
   const { name, dir } = proc;
   const pid = getPid(dir);
   if (!pid) { onReturn(); return; }
@@ -296,7 +296,10 @@ function runAttach(proc, onReturn) {
 
   function attachBarText() {
     const pause = attachPaused ? "  [PAUSED]" : "";
-    return `${name}  │  ${getCmd(dir)}  │  pid ${pid}  │  ${formatUptime(attachStartTime)}${pause}  │  q/Ctrl+C: quit+kill  d: detach  p: pause`;
+    const keys = safeQuit
+      ? "q/Esc: back  Ctrl+C: kill  d: detach  p: pause"
+      : "q/Ctrl+C: quit+kill  d: detach  p: pause";
+    return `${name}  │  ${getCmd(dir)}  │  pid ${pid}  │  ${formatUptime(attachStartTime)}${pause}  │  ${keys}`;
   }
   drawBar(attachBarText());
 
@@ -342,7 +345,18 @@ function runAttach(proc, onReturn) {
   }, 1000);
 
   function attachKeyHandler(key) {
-    if (key[0] === 0x71 || key[0] === 0x03) {
+    // q or Esc: safe back (if safeQuit), otherwise kill
+    if (key[0] === 0x71 || (safeQuit && key[0] === 0x1b && key.length === 1)) {
+      if (safeQuit) {
+        cleanupAttach();
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
+        onReturn();
+        return;
+      }
+      // fallthrough to kill (standalone attach)
+    }
+    // Ctrl+C or q (standalone): kill process
+    if (key[0] === 0x03 || (!safeQuit && key[0] === 0x71)) {
       cleanupAttach();
       if (process.stdin.isTTY) process.stdin.setRawMode(false);
       try { process.kill(-pid, "SIGTERM"); } catch {}
@@ -355,6 +369,7 @@ function runAttach(proc, onReturn) {
       console.log(`\n[roo:${name}] killed`);
       process.exit(0);
     }
+    // d: detach (leave running)
     if (key[0] === 0x64) {
       cleanupAttach();
       if (process.stdin.isTTY) process.stdin.setRawMode(false);
@@ -756,7 +771,7 @@ else if (sub === "top") {
       process.stdout.write("\x1b[?1049l");
       runAttach(selected, () => {
         returnToTop();
-      });
+      }, { safeQuit: true });
       return;
     }
     // s: stop
