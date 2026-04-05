@@ -117,30 +117,28 @@ function pidAlive(pid) {
 }
 
 function getPid(dir) {
-  const f = pidFile(dir);
-  if (!fs.existsSync(f)) return null;
-  const pid = parseInt(fs.readFileSync(f, "utf8").trim());
-  return pidAlive(pid) ? pid : null;
+  try {
+    const pid = parseInt(fs.readFileSync(pidFile(dir), "utf8").trim());
+    return pidAlive(pid) ? pid : null;
+  } catch { return null; }
 }
 
 function getCmd(dir) {
-  const f = cmdFile(dir);
-  return fs.existsSync(f) ? fs.readFileSync(f, "utf8").trim() : "?";
+  try { return fs.readFileSync(cmdFile(dir), "utf8").trim(); }
+  catch { return "?"; }
 }
 
 function getStarted(dir) {
-  const f = startedFile(dir);
-  return fs.existsSync(f) ? fs.readFileSync(f, "utf8").trim() : "?";
+  try { return fs.readFileSync(startedFile(dir), "utf8").trim(); }
+  catch { return "?"; }
 }
 
 function allProcs() {
-  if (!fs.existsSync(ROO_DIR)) return [];
-  return fs.readdirSync(ROO_DIR)
-    .filter((d) => {
-      const full = path.join(ROO_DIR, d);
-      return fs.statSync(full).isDirectory() && fs.existsSync(path.join(full, "cmd"));
-    })
-    .map((d) => ({ name: d, dir: path.join(ROO_DIR, d) }));
+  try {
+    return fs.readdirSync(ROO_DIR, { withFileTypes: true })
+      .filter((ent) => ent.isDirectory() && fs.existsSync(path.join(ROO_DIR, ent.name, "cmd")))
+      .map((ent) => ({ name: ent.name, dir: path.join(ROO_DIR, ent.name) }));
+  } catch { return []; }
 }
 
 function allProcsGlobal() {
@@ -224,29 +222,32 @@ function resetTerminal() {
 
 // ── Top helpers ──
 
+const COL_NAME_W = 16;
+const COL_DIR_W = 22;
+const COL_STATUS_W = 10;
+const COL_PID_W = 8;
+const COL_UPTIME_W = 10;
+
+function truncPad(str, w, align) {
+  if (str.length > w) return str.slice(0, w - 1) + "~";
+  return align === "right" ? str.padStart(w) : str.padEnd(w);
+}
+
 function formatColumns(name, status, pid, uptime, cmd, totalWidth, dir) {
-  const nameW = 16;
-  const dirW = dir !== undefined ? 22 : 0;
-  const statusW = 10;
-  const pidW = 8;
-  const uptimeW = 10;
-  const fixedW = nameW + dirW + statusW + pidW + uptimeW + 5 + (dirW ? 1 : 0);
+  const hasDir = dir !== undefined;
+  const fixedW = COL_NAME_W + (hasDir ? COL_DIR_W + 1 : 0) + COL_STATUS_W + COL_PID_W + COL_UPTIME_W + 5;
   const cmdW = Math.max(10, totalWidth - fixedW);
-  const n = name.length > nameW ? name.slice(0, nameW - 1) + "~" : name.padEnd(nameW);
-  const st = status.padEnd(statusW);
-  const pi = pid.padStart(pidW);
-  const up = uptime.padStart(uptimeW);
-  const cm = cmd.length > cmdW ? cmd.slice(0, cmdW - 1) + "~" : cmd.padEnd(cmdW);
-  if (dir !== undefined) {
-    const d = dir.length > dirW ? dir.slice(0, dirW - 1) + "~" : dir.padEnd(dirW);
-    return `${n} ${d} ${st} ${pi} ${up}  ${cm}`;
-  }
-  return `${n} ${st} ${pi} ${up}  ${cm}`;
+  const parts = [truncPad(name, COL_NAME_W, "left")];
+  if (hasDir) parts.push(truncPad(dir, COL_DIR_W, "left"));
+  parts.push(truncPad(status, COL_STATUS_W, "left"));
+  parts.push(truncPad(pid, COL_PID_W, "right"));
+  parts.push(truncPad(uptime, COL_UPTIME_W, "right"));
+  return parts.join(" ") + "  " + truncPad(cmd, cmdW, "left");
 }
 
 function colorizeRow(line, running, hasDir) {
-  const statusStart = hasDir ? 40 : 17;
-  const statusEnd = statusStart + 10;
+  const statusStart = COL_NAME_W + 1 + (hasDir ? COL_DIR_W + 1 : 0);
+  const statusEnd = statusStart + COL_STATUS_W;
   const before = line.slice(0, statusStart);
   const statusText = line.slice(statusStart, statusEnd);
   const after = line.slice(statusEnd);
@@ -345,7 +346,7 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
   }, 1000);
 
   function attachKeyHandler(key) {
-    // q or Esc: safe back (if safeQuit), otherwise kill
+    // q or Esc: safe back when called from top, kill when standalone
     if (key[0] === 0x71 || (safeQuit && key[0] === 0x1b && key.length === 1)) {
       if (safeQuit) {
         cleanupAttach();
@@ -353,9 +354,8 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
         onReturn();
         return;
       }
-      // fallthrough to kill (standalone attach)
     }
-    // Ctrl+C or q (standalone): kill process
+    // Ctrl+C always kills; q kills only in standalone mode
     if (key[0] === 0x03 || (!safeQuit && key[0] === 0x71)) {
       cleanupAttach();
       if (process.stdin.isTTY) process.stdin.setRawMode(false);
@@ -724,6 +724,9 @@ else if (sub === "top") {
     procList = refreshProcList();
     renderTop();
     topInterval = setInterval(topTick, 1000);
+    // Remove first to prevent stacking listeners across attach/return cycles
+    process.stdin.removeListener("data", topKeyHandler);
+    process.stdout.removeListener("resize", topResizeHandler);
     process.stdin.on("data", topKeyHandler);
     process.stdout.on("resize", topResizeHandler);
   }
