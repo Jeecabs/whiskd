@@ -30,6 +30,11 @@ roo start --name api node server.js
 
 # Check what's running
 roo status
+roo status --json
+
+# Live dashboard
+roo top
+roo top --global    # all directories
 
 # View logs (last 40 lines by default)
 roo logs
@@ -46,12 +51,24 @@ roo stop --all
 roo clean
 ```
 
-## TUI keys
+## TUI keys (foreground/attach)
 
 | Key | Action |
 |-----|--------|
 | `q` / `Ctrl+C` | Kill process and exit |
 | `d` | Detach (leave running in background) |
+| `p` | Pause/unpause output |
+
+## Top keys
+
+| Key | Action |
+|-----|--------|
+| `q` / `Ctrl+C` | Quit top |
+| `↑`/`↓`/`j`/`k` | Select process |
+| `Enter` / `a` | Attach to selected process |
+| `s` | Stop selected process |
+| `l` | View logs of selected process |
+| `g` | Toggle global/local view |
 
 ## Auto-naming
 
