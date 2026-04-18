@@ -1,21 +1,44 @@
 #!/usr/bin/env node
 
 const { spawn } = require("child_process");
+const { stripVTControlCharacters: stripAnsi } = require("util");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+
+const VERSION = "1.0.1";
 
 const ROO_BASE = path.join("/tmp", "roo");
 const ROO_DIR = path.join(ROO_BASE, process.cwd());
 
 const MAX_LOG_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const MAX_PAUSE_BYTES = 2 * 1024 * 1024;  // cap pause buffers so paused noisy children can't eat RSS
+const LOG_TAIL_BYTES = 256 * 1024;        // window when tailing logs for display
 
-const stripAnsi = (str) =>
-  str.replace(
-    /[\u001b\u009b]\[[0-9;]*[a-zA-Z]|\u001b\].*?(?:\u0007|\u001b\\)/g,
-    ""
-  );
+function killTree(pid) {
+  try { process.kill(-pid, "SIGTERM"); } catch {}
+  try { process.kill(pid, "SIGTERM"); } catch {}
+}
+
+function forceKillTree(pid) {
+  try { process.kill(-pid, "SIGKILL"); } catch {}
+  try { process.kill(pid, "SIGKILL"); } catch {}
+}
+
+function readLogTail(logPath, maxBytes = LOG_TAIL_BYTES) {
+  try {
+    const stat = fs.statSync(logPath);
+    if (stat.size <= maxBytes) return fs.readFileSync(logPath, "utf8");
+    const buf = Buffer.alloc(maxBytes);
+    const fd = fs.openSync(logPath, "r");
+    fs.readSync(fd, buf, 0, maxBytes, stat.size - maxBytes);
+    fs.closeSync(fd);
+    const text = buf.toString();
+    const nl = text.indexOf("\n");
+    return nl >= 0 ? text.slice(nl + 1) : text;
+  } catch { return ""; }
+}
 
 // ── Housekeeping ──
 
@@ -286,7 +309,7 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
 
   setupScrollRegion();
 
-  const existing = fs.readFileSync(log, "utf8");
+  const existing = readLogTail(log);
   const rows = process.stdout.rows || 24;
   const recentLines = existing.split("\n").slice(-(rows - 5));
   for (const line of recentLines) process.stdout.write(line + "\n");
@@ -294,6 +317,14 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
   const attachStartTime = new Date(getStarted(dir)).getTime();
   let attachPaused = false;
   let attachPauseBuf = [];
+  let attachPauseBufBytes = 0;
+  function attachPushPaused(chunk) {
+    attachPauseBuf.push(chunk);
+    attachPauseBufBytes += Buffer.byteLength(chunk);
+    while (attachPauseBufBytes > MAX_PAUSE_BYTES && attachPauseBuf.length > 1) {
+      attachPauseBufBytes -= Buffer.byteLength(attachPauseBuf.shift());
+    }
+  }
 
   function attachBarText() {
     const pause = attachPaused ? "  [PAUSED]" : "";
@@ -315,11 +346,8 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
         fs.closeSync(fd);
         filePos = stat.size;
         const data = buf.toString();
-        if (attachPaused) {
-          attachPauseBuf.push(data);
-        } else {
-          process.stdout.write(data);
-        }
+        if (attachPaused) attachPushPaused(data);
+        else process.stdout.write(data);
         drawBar(attachBarText());
       }
     } catch {}
@@ -359,13 +387,9 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
     if (key[0] === 0x03 || (!safeQuit && key[0] === 0x71)) {
       cleanupAttach();
       if (process.stdin.isTTY) process.stdin.setRawMode(false);
-      try { process.kill(-pid, "SIGTERM"); } catch {}
-      try { process.kill(pid, "SIGTERM"); } catch {}
+      killTree(pid);
       try { fs.unlinkSync(pidFile(dir)); } catch {}
-      setTimeout(() => {
-        try { process.kill(-pid, "SIGKILL"); } catch {}
-        try { process.kill(pid, "SIGKILL"); } catch {}
-      }, 2000);
+      setTimeout(() => forceKillTree(pid), 2000);
       console.log(`\n[roo:${name}] killed`);
       process.exit(0);
     }
@@ -380,6 +404,7 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
       if (!attachPaused && attachPauseBuf.length > 0) {
         process.stdout.write(attachPauseBuf.join(""));
         attachPauseBuf = [];
+        attachPauseBufBytes = 0;
       }
       drawBar(attachBarText());
     }
@@ -401,6 +426,11 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
 // ── Commands ──
 
 const sub = process.argv[2];
+
+if (sub === "--version" || sub === "-v") {
+  console.log(`roo ${VERSION}`);
+  process.exit(0);
+}
 
 if (!sub || sub === "--help" || sub === "-h") {
   console.log(`roo - lightweight process wrapper with TUI
@@ -482,18 +512,22 @@ if (sub === "stop") {
 
   if (arg === "--all") {
     const procs = allProcs();
-    let stopped = 0;
+    const killed = [];
     for (const { name, dir } of procs) {
       const pid = getPid(dir);
       if (pid) {
-        process.kill(pid, "SIGTERM");
+        try { process.kill(pid, "SIGTERM"); } catch {}
         console.log(`stopped  ${name}  pid=${pid}`);
-        stopped++;
+        killed.push({ name, dir, pid });
       }
     }
-    if (stopped === 0) console.log("nothing running");
+    if (killed.length === 0) console.log("nothing running");
     setTimeout(() => {
-      for (const { dir } of procs) {
+      for (const { name, dir, pid } of killed) {
+        if (pidAlive(pid)) {
+          try { process.kill(pid, "SIGKILL"); } catch {}
+          console.log(`force killed ${name}`);
+        }
         try { fs.unlinkSync(pidFile(dir)); } catch {}
       }
       process.exit(0);
@@ -505,11 +539,11 @@ if (sub === "stop") {
   if (!proc) { console.log("nothing running"); process.exit(0); }
   const pid = getPid(proc.dir);
   if (!pid) { console.log(`${proc.name}: not running`); process.exit(0); }
-  process.kill(pid, "SIGTERM");
+  try { process.kill(pid, "SIGTERM"); } catch {}
   console.log(`stopped  ${proc.name}  pid=${pid}`);
   setTimeout(() => {
-    if (getPid(proc.dir)) {
-      process.kill(pid, "SIGKILL");
+    if (pidAlive(pid)) {
+      try { process.kill(pid, "SIGKILL"); } catch {}
       console.log(`force killed ${proc.name}`);
     }
     try { fs.unlinkSync(pidFile(proc.dir)); } catch {}
@@ -550,7 +584,7 @@ else if (sub === "logs") {
   if (!proc) { console.log("no processes"); process.exit(0); }
   const log = logFile(proc.dir);
   if (!fs.existsSync(log)) { console.log(`${proc.name}: no logs yet`); process.exit(0); }
-  const lines = fs.readFileSync(log, "utf8").split("\n");
+  const lines = readLogTail(log).split("\n");
   console.log(lines.slice(Math.max(0, lines.length - n)).join("\n"));
   process.exit(0);
 }
@@ -571,21 +605,28 @@ else if (sub === "top") {
   let logsLines = [];
   let logsScroll = 0;
 
+  const procMetaCache = new Map();
   function refreshProcList() {
     const procs = topGlobal ? allProcsGlobal() : allProcs();
     return procs.map((p) => {
+      let meta = procMetaCache.get(p.dir);
+      if (!meta) {
+        const started = getStarted(p.dir);
+        meta = {
+          cmd: getCmd(p.dir),
+          startMs: started !== "?" ? new Date(started).getTime() : null,
+        };
+        procMetaCache.set(p.dir, meta);
+      }
       const pid = getPid(p.dir);
-      const cmd = getCmd(p.dir);
-      const started = getStarted(p.dir);
-      const startMs = started !== "?" ? new Date(started).getTime() : null;
       return {
         name: p.name,
         dir: p.dir,
         cwd: p.cwd || null,
         running: !!pid,
         pid: pid || null,
-        uptime: pid && startMs ? formatUptime(startMs) : null,
-        cmd,
+        uptime: pid && meta.startMs ? formatUptime(meta.startMs) : null,
+        cmd: meta.cmd,
       };
     }).sort((a, b) => {
       if (a.running !== b.running) return a.running ? -1 : 1;
@@ -689,11 +730,8 @@ else if (sub === "top") {
     logsName = proc.name;
     logsScroll = 0;
     const log = logFile(proc.dir);
-    if (fs.existsSync(log)) {
-      logsLines = fs.readFileSync(log, "utf8").split("\n");
-    } else {
-      logsLines = ["(no logs)"];
-    }
+    const tail = readLogTail(log, 1024 * 1024);
+    logsLines = tail ? tail.split("\n") : ["(no logs)"];
     renderLogs();
   }
 
@@ -860,7 +898,7 @@ else if (sub === "start") {
   const header = `[roo:${name}] started: ${rest.join(" ")}\n[roo:${name}] time: ${now}\n[roo:${name}] ${"—".repeat(60)}\n`;
   fs.writeSync(logFd, header);
 
-  const child = spawn(rest[0], rest.slice(1), {
+  const child = spawn(rest.join(" "), {
     stdio: ["ignore", logFd, logFd],
     shell: true,
     detached: true,
@@ -899,22 +937,12 @@ else {
   const log = logFile(dir);
   const logStream = fs.createWriteStream(log, { flags: "w" });
   const now = new Date().toISOString();
-  let logBytes = 0;
-  const writeLog = (str) => {
-    if (logBytes > MAX_LOG_BYTES) return;
-    logStream.write(str);
-    logBytes += Buffer.byteLength(str);
-    if (logBytes > MAX_LOG_BYTES) {
-      logStream.end();
-      truncateLog(log);
-      // Reopen in append mode for any final messages
-    }
-  };
+  const writeLog = (str) => { logStream.write(str); };
   writeLog(`[roo:${name}] started: ${cmd.join(" ")}\n`);
   writeLog(`[roo:${name}] time: ${now}\n`);
   writeLog(`[roo:${name}] ${"—".repeat(60)}\n`);
 
-  const child = spawn(cmd[0], cmd.slice(1), {
+  const child = spawn(cmd.join(" "), {
     stdio: ["ignore", "pipe", "pipe"],
     shell: true,
     detached: true,
@@ -930,6 +958,14 @@ else {
   const fgStartTime = Date.now();
   let fgPaused = false;
   let fgPauseBuf = [];
+  let fgPauseBufBytes = 0;
+  function fgPushPaused(chunk) {
+    fgPauseBuf.push(chunk);
+    fgPauseBufBytes += chunk.length;
+    while (fgPauseBufBytes > MAX_PAUSE_BYTES && fgPauseBuf.length > 1) {
+      fgPauseBufBytes -= fgPauseBuf.shift().length;
+    }
+  }
 
   function fgBarText() {
     const pause = fgPaused ? "  [PAUSED]" : "";
@@ -940,23 +976,16 @@ else {
   const fgBarTick = setInterval(() => drawBar(fgBarText()), 1000);
 
   child.stdout.on("data", (data) => {
-    if (fgPaused) {
-      fgPauseBuf.push(data);
-    } else {
-      process.stdout.write(data);
-    }
+    if (fgPaused) fgPushPaused(data);
+    else process.stdout.write(data);
     writeLog(stripAnsi(data.toString()));
-    drawBar(fgBarText());
   });
 
   child.stderr.on("data", (data) => {
-    if (fgPaused) {
-      fgPauseBuf.push(Buffer.from(`\x1b[2;31m${data}\x1b[0m`));
-    } else {
-      process.stdout.write(`\x1b[2;31m${data}\x1b[0m`);
-    }
+    const colored = Buffer.from(`\x1b[2;31m${data}\x1b[0m`);
+    if (fgPaused) fgPushPaused(colored);
+    else process.stdout.write(colored);
     writeLog(stripAnsi(data.toString()));
-    drawBar(fgBarText());
   });
 
   if (process.stdin.isTTY) {
@@ -965,33 +994,23 @@ else {
     let killing = false;
     process.stdin.on("data", (key) => {
       if (key[0] === 0x71 || key[0] === 0x03) {
-        // q or Ctrl+C = kill + exit
+        // q or Ctrl+C: first press SIGTERMs and schedules SIGKILL, second press escalates now
         clearInterval(fgBarTick);
-        if (!killing) {
-          killing = true;
-          try { process.kill(-child.pid, "SIGTERM"); } catch {}
-          child.kill("SIGTERM");
-          // force kill + exit if SIGTERM doesn't work after 2s
-          setTimeout(() => {
-            try { process.kill(-child.pid, "SIGKILL"); } catch {}
-            try { child.kill("SIGKILL"); } catch {}
-            resetTerminal();
-            process.stdin.setRawMode(false);
-            try { fs.unlinkSync(pidFile(dir)); } catch {}
-            logStream.end();
-            console.log(`\n[roo:${name}] force killed`);
-            process.exit(1);
-          }, 2000);
-        } else {
-          // second press = force kill immediately
-          try { process.kill(-child.pid, "SIGKILL"); } catch {}
-          try { child.kill("SIGKILL"); } catch {}
+        const finish = () => {
           resetTerminal();
           process.stdin.setRawMode(false);
           try { fs.unlinkSync(pidFile(dir)); } catch {}
           logStream.end();
           console.log(`\n[roo:${name}] force killed`);
           process.exit(1);
+        };
+        if (!killing) {
+          killing = true;
+          killTree(child.pid);
+          setTimeout(() => { forceKillTree(child.pid); finish(); }, 2000);
+        } else {
+          forceKillTree(child.pid);
+          finish();
         }
       }
       if (key[0] === 0x64) {
@@ -1013,6 +1032,7 @@ else {
         if (!fgPaused && fgPauseBuf.length > 0) {
           for (const chunk of fgPauseBuf) process.stdout.write(chunk);
           fgPauseBuf = [];
+          fgPauseBufBytes = 0;
         }
         drawBar(fgBarText());
       }
@@ -1025,15 +1045,18 @@ else {
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     logStream.write(`\n[roo:${name}] exited with code ${code}\n`);
     try { fs.unlinkSync(pidFile(dir)); } catch {}
-    logStream.end();
     console.log(`\n[roo:${name}] exited with code ${code}`);
-    process.exit(code ?? 1);
+    logStream.end(() => {
+      truncateLog(log);
+      process.exit(code ?? 1);
+    });
   });
 
   child.on("error", (err) => {
     clearInterval(fgBarTick);
     resetTerminal();
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    try { fs.unlinkSync(pidFile(dir)); } catch {}
     console.error(`[roo:${name}] failed: ${err.message}`);
     logStream.end();
     process.exit(1);
