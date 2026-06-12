@@ -98,11 +98,28 @@ function ensureBase() {
 }
 
 // ── Housekeeping ──
+// Runs before every command (except --version/--help). Reconciliation must
+// stay pre-dispatch: uniqueName/resolveName rely on stale pids being cleared.
 
 function housekeep() {
   ensureBase();
   const now = Date.now();
   pruneOldDirs(ROO_BASE, now);
+}
+
+// The parent that would have written the exit footer often exits long before
+// its detached child does, so discover deaths here: dead pid (or a pid that
+// now belongs to someone else) → clear the pid file and record the exit.
+// Live procs get the 10MB cap enforced (safe under O_APPEND writers).
+function reconcileDir(procPath) {
+  let raw;
+  try { raw = fs.readFileSync(pidFile(procPath), "utf8"); } catch { return; }
+  const pid = parseInt(raw.trim());
+  if (!isNaN(pid) && pid > 1 && pidAlive(pid) && pidIdentityOk(procPath, pid)) {
+    truncateLog(logFile(procPath));
+    return;
+  }
+  markDead(path.basename(procPath), procPath, "exited (status unknown)");
 }
 
 function pruneOldDirs(dir, now) {
@@ -111,9 +128,10 @@ function pruneOldDirs(dir, now) {
   for (const ent of entries) {
     const full = path.join(dir, ent.name);
     if (!ent.isDirectory()) continue;
-    // If this dir has a "cmd" file, it's a process dir — check age
+    // If this dir has a "cmd" file, it's a process dir — reconcile, then check age
     const cmd = path.join(full, "cmd");
     if (fs.existsSync(cmd)) {
+      reconcileDir(full);
       try {
         const mtime = fs.statSync(cmd).mtimeMs;
         if (now - mtime > MAX_AGE_MS) {
@@ -555,6 +573,7 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
   const poll = setInterval(() => {
     try {
       const stat = fs.statSync(log);
+      if (stat.size < filePos) filePos = stat.size; // log truncated under us
       if (stat.size > filePos) {
         const fd = fs.openSync(log, "r");
         const buf = Buffer.alloc(stat.size - filePos);
@@ -582,6 +601,7 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
   }
 
   const statusPoll = setInterval(() => {
+    truncateLog(log); // keep the cap enforced during long attach sessions
     if (!getPid(dir)) {
       cleanupAttach();
       if (process.stdin.isTTY) process.stdin.setRawMode(false);
@@ -932,6 +952,8 @@ else if (sub === "top") {
   function topTick() {
     const prevName = procList[topCursor]?.name;
     procList = refreshProcList();
+    // Keep the cap enforced while top is open (cheap: one stat per running proc).
+    for (const p of procList) if (p.running) truncateLog(logFile(p.dir));
     if (prevName) {
       const idx = procList.findIndex((p) => p.name === prevName);
       topCursor = idx >= 0 ? idx : Math.min(topCursor, Math.max(0, procList.length - 1));
@@ -1158,9 +1180,8 @@ else if (sub === "start") {
     console.log(`  roo stop ${name}`);
 
     child.on("close", (code) => {
-      fs.appendFileSync(log, `\n[roo:${name}] exited with code ${code}\n`, { mode: 0o600 });
-      truncateLog(log);
-      try { fs.unlinkSync(pidFile(dir)); } catch {}
+      // Live for sub-300ms failures; later deaths are caught by reconcile.
+      markDead(name, dir, `exited with code ${code}`);
     });
 
     setTimeout(() => process.exit(0), 300);
