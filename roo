@@ -528,13 +528,20 @@ function resolveName(explicit) {
 }
 
 // ── Attach (reusable) ──
+// Contract: onReturn(reason) fires exactly once with "exited" or "detached"
+// (including the early returns). opts.onKill, when given, takes over the kill
+// keys so the caller (fg) can own escalation and exit codes. The returned
+// shutdown(reason) handle lets a caller tear the UI down externally (fg's
+// close handler). Every death/teardown path does a final synchronous drain
+// of the log from filePos to EOF, so footers and last output are never lost
+// to the 100ms poll being cleared first.
 
-function runAttach(proc, onReturn, { safeQuit = false } = {}) {
+function runAttach(proc, onReturn, { safeQuit = false, onKill = null } = {}) {
   const { name, dir } = proc;
   const pid = getPid(dir);
-  if (!pid) { onReturn(); return; }
+  if (!pid) { onReturn("exited"); return { shutdown: () => {} }; }
   const log = logFile(dir);
-  if (!fs.existsSync(log)) { onReturn(); return; }
+  if (!fs.existsSync(log)) { onReturn("detached"); return { shutdown: () => {} }; }
 
   setupScrollRegion();
 
@@ -590,7 +597,9 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
 
   const barTick = setInterval(() => drawBar(attachBarText()), 1000);
 
-  function cleanupAttach() {
+  let finished = false;
+
+  function teardownUI() {
     clearInterval(poll);
     clearInterval(statusPoll);
     clearInterval(barTick);
@@ -598,38 +607,69 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
     unregisterRestore(restoreAttach);
     process.stdin.removeListener("data", attachKeyHandler);
     process.stdout.removeListener("resize", attachResizeHandler);
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+  }
+
+  // Final synchronous catch-up: flush anything held by pause, then read
+  // filePos→EOF straight to stdout.
+  function drainTail() {
+    if (attachPauseBuf.length > 0) {
+      process.stdout.write(attachPauseBuf.join(""));
+      attachPauseBuf = [];
+      attachPauseBufBytes = 0;
+    }
+    try {
+      const stat = fs.statSync(log);
+      if (stat.size > filePos) {
+        const fd = fs.openSync(log, "r");
+        const buf = Buffer.alloc(stat.size - filePos);
+        fs.readSync(fd, buf, 0, buf.length, filePos);
+        fs.closeSync(fd);
+        filePos = stat.size;
+        process.stdout.write(buf.toString());
+      }
+    } catch {}
+  }
+
+  function shutdown(reason) {
+    if (finished) return;
+    finished = true;
+    teardownUI();
+    drainTail();
+    onReturn(reason);
   }
 
   const statusPoll = setInterval(() => {
     truncateLog(log); // keep the cap enforced during long attach sessions
     if (!getPid(dir)) {
-      cleanupAttach();
-      if (process.stdin.isTTY) process.stdin.setRawMode(false);
-      console.log(`\n[roo:${name}] process exited`);
-      onReturn();
+      // Death discovered here means nobody else recorded it (or a stop
+      // elsewhere already did, in which case markDead loses the unlink
+      // race and writes nothing).
+      markDead(name, dir, "exited (status unknown)");
+      shutdown("exited");
     }
   }, 1000);
 
   function attachKeyHandler(key) {
-    // q or Esc: safe back when called from top, kill when standalone
-    if (key[0] === 0x71 || (safeQuit && key[0] === 0x1b && key.length === 1)) {
-      if (safeQuit) {
-        cleanupAttach();
-        if (process.stdin.isTTY) process.stdin.setRawMode(false);
-        onReturn();
-        return;
-      }
+    if (finished) return;
+    // q or Esc: safe back when called from top
+    if (safeQuit && (key[0] === 0x71 || (key[0] === 0x1b && key.length === 1))) {
+      shutdown("detached");
+      return;
     }
     // Ctrl+C always kills; q kills only in standalone mode
     if (key[0] === 0x03 || (!safeQuit && key[0] === 0x71)) {
-      cleanupAttach();
-      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+      if (onKill) { onKill(); return; } // caller owns kill + teardown timing
+      finished = true;
+      teardownUI();
       if (!pidIdentityOk(dir, pid)) {
         markDead(name, dir, "exited (status unknown)");
+        drainTail();
         console.log(`\n[roo:${name}] already exited (stale pid)`);
         process.exit(0);
       }
       killProcs([{ name, dir, pid }], {}, () => {
+        drainTail();
         console.log(`\n[roo:${name}] killed`);
         process.exit(0);
       });
@@ -637,9 +677,8 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
     }
     // d: detach (leave running)
     if (key[0] === 0x64) {
-      cleanupAttach();
-      if (process.stdin.isTTY) process.stdin.setRawMode(false);
-      onReturn();
+      shutdown("detached");
+      return;
     }
     if (key[0] === 0x70) {
       attachPaused = !attachPaused;
@@ -663,6 +702,8 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
   }
   process.stdin.on("data", attachKeyHandler);
   process.stdout.on("resize", attachResizeHandler);
+
+  return { shutdown };
 }
 
 // ── Commands ──
@@ -1128,8 +1169,9 @@ else if (sub === "attach") {
   if (!proc) { console.log("nothing to attach to"); process.exit(0); }
   const pid = getPid(proc.dir);
   if (!pid) { console.log(`${proc.name}: not running`); process.exit(0); }
-  runAttach(proc, () => {
-    console.log(`\n[roo:${proc.name}] detached. still running.`);
+  runAttach(proc, (reason) => {
+    if (reason === "exited") console.log(`\n[roo:${proc.name}] process exited`);
+    else console.log(`\n[roo:${proc.name}] detached. still running.`);
     process.exit(0);
   });
 }
