@@ -84,4 +84,12 @@ Use `--name` / `-n` to override.
 
 ## Logs
 
-Logs are stored in `/tmp/roo/<cwd>/<name>/output.log`. ANSI codes are stripped from log files. Logs are capped at 10MB and old process dirs are pruned after 7 days.
+Logs are stored in `/tmp/roo-<uid>/<cwd>/<name>/output.log` (a private, per-user directory with `0700` permissions). ANSI codes are stripped from log files. Logs are capped at 10MB and old process dirs are pruned after 7 days.
+
+### Migrating from 1.x
+
+1.x stored state in the shared `/tmp/roo` tree, which 2.x no longer reads — processes started by an old roo are invisible to the new one. Stop them with the old binary (or `kill` them manually), then remove the old tree:
+
+```sh
+rm -rf /tmp/roo
+```
