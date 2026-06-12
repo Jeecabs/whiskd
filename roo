@@ -8,7 +8,9 @@ const path = require("path");
 
 const VERSION = "1.0.1";
 
-const ROO_BASE = path.join("/tmp", "roo");
+// Per-user state dir. Deliberately /tmp, not os.tmpdir(): on macOS $TMPDIR
+// differs between GUI and SSH sessions, which would split state in two.
+const ROO_BASE = path.join("/tmp", "roo-" + (typeof process.getuid === "function" ? process.getuid() : "u"));
 const ROO_DIR = path.join(ROO_BASE, process.cwd());
 
 const MAX_LOG_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -68,10 +70,37 @@ function readLogTail(logPath, maxBytes = LOG_TAIL_BYTES) {
   } catch { return ""; }
 }
 
+function die(msg) {
+  console.error(`roo: ${msg}`);
+  process.exit(1);
+}
+
+// ── State dir init ──
+// Create-then-verify (lstat after mkdir) so a symlink planted at the path is
+// always caught, even if it appears between the two calls.
+
+let baseEnsured = false;
+function ensureBase() {
+  if (baseEnsured) return;
+  try { fs.mkdirSync(ROO_BASE, { recursive: true, mode: 0o700 }); } catch {}
+  let st;
+  try { st = fs.lstatSync(ROO_BASE); } catch (e) {
+    die(`cannot create state dir ${ROO_BASE}: ${e.message}`);
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    die(`state path ${ROO_BASE} is not a directory (possible tampering).\n  remove it with: rm -rf ${ROO_BASE}`);
+  }
+  if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
+    die(`state dir ${ROO_BASE} is owned by uid ${st.uid}, not you (uid ${process.getuid()}).\n  remove it with: rm -rf ${ROO_BASE}`);
+  }
+  try { fs.chmodSync(ROO_BASE, 0o700); } catch {}
+  baseEnsured = true;
+}
+
 // ── Housekeeping ──
 
 function housekeep() {
-  if (!fs.existsSync(ROO_BASE)) return;
+  ensureBase();
   const now = Date.now();
   pruneOldDirs(ROO_BASE, now);
 }
@@ -119,11 +148,9 @@ function truncateLog(logPath) {
     const text = buf.toString();
     const firstNewline = text.indexOf("\n");
     const kept = firstNewline >= 0 ? text.slice(firstNewline + 1) : text;
-    fs.writeFileSync(logPath, `[roo] log truncated (exceeded ${MAX_LOG_BYTES / 1024 / 1024}MB)\n` + kept);
+    fs.writeFileSync(logPath, `[roo] log truncated (exceeded ${MAX_LOG_BYTES / 1024 / 1024}MB)\n` + kept, { mode: 0o600 });
   } catch {}
 }
-
-housekeep();
 
 // ── Naming ──
 
@@ -160,7 +187,19 @@ function startedFile(dir) { return path.join(dir, "started"); }
 
 function ensureProc(name) {
   const d = procDir(name);
-  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+}
+
+// Fresh log per run. Unlink first so a previous run's writer keeps its own
+// orphaned inode; open with O_APPEND so later truncation under a live writer
+// can't leave a NUL hole (the child's next write lands at the new EOF).
+function openLog(log) {
+  try { fs.unlinkSync(log); } catch {}
+  try {
+    return fs.openSync(log, "a", 0o600);
+  } catch (e) {
+    die(`cannot open log ${log}: ${e.message}`);
+  }
 }
 
 function pidAlive(pid) {
@@ -497,11 +536,15 @@ Names are auto-derived from commands:
   npm run build → build    python app.py → app
 
 Multiple processes per directory:
-  roo start npm run dev        → .roo/dev/output.log
-  roo start npm run build      → .roo/build/output.log
-  roo start --name api npm run start → .roo/api/output.log`);
+  roo start npm run dev                → dev
+  roo start npm run build              → build
+  roo start --name api npm run start   → api
+
+State and logs live in ${ROO_BASE}/<cwd>/<name>/output.log`);
   process.exit(0);
 }
+
+housekeep();
 
 // ── status ──
 if (sub === "status") {
@@ -937,7 +980,7 @@ else if (sub === "start") {
   const dir = procDir(name);
 
   const log = logFile(dir);
-  const logFd = fs.openSync(log, "w");
+  const logFd = openLog(log);
   const now = new Date().toISOString();
   const header = `[roo:${name}] started: ${rest.join(" ")}\n[roo:${name}] time: ${now}\n[roo:${name}] ${"—".repeat(60)}\n`;
   fs.writeSync(logFd, header);
@@ -949,9 +992,9 @@ else if (sub === "start") {
     env: { ...process.env, FORCE_COLOR: "0" },
   });
 
-  fs.writeFileSync(pidFile(dir), String(child.pid));
-  fs.writeFileSync(cmdFile(dir), rest.join(" "));
-  fs.writeFileSync(startedFile(dir), now);
+  fs.writeFileSync(pidFile(dir), String(child.pid), { mode: 0o600 });
+  fs.writeFileSync(cmdFile(dir), rest.join(" "), { mode: 0o600 });
+  fs.writeFileSync(startedFile(dir), now, { mode: 0o600 });
   child.unref();
 
   console.log(`started  name=${name}  pid=${child.pid}`);
@@ -961,7 +1004,7 @@ else if (sub === "start") {
   console.log(`  roo stop ${name}`);
 
   child.on("close", (code) => {
-    fs.appendFileSync(log, `\n[roo:${name}] exited with code ${code}\n`);
+    fs.appendFileSync(log, `\n[roo:${name}] exited with code ${code}\n`, { mode: 0o600 });
     truncateLog(log);
     try { fs.unlinkSync(pidFile(dir)); } catch {}
   });
@@ -979,7 +1022,8 @@ else {
   const dir = procDir(name);
 
   const log = logFile(dir);
-  const logStream = fs.createWriteStream(log, { flags: "w" });
+  try { fs.unlinkSync(log); } catch {}
+  const logStream = fs.createWriteStream(log, { flags: "a", mode: 0o600 });
   const now = new Date().toISOString();
   const writeLog = (str) => { logStream.write(str); };
   writeLog(`[roo:${name}] started: ${cmd.join(" ")}\n`);
@@ -993,9 +1037,9 @@ else {
     env: { ...process.env, FORCE_COLOR: "1" },
   });
 
-  fs.writeFileSync(pidFile(dir), String(child.pid));
-  fs.writeFileSync(cmdFile(dir), cmd.join(" "));
-  fs.writeFileSync(startedFile(dir), now);
+  fs.writeFileSync(pidFile(dir), String(child.pid), { mode: 0o600 });
+  fs.writeFileSync(cmdFile(dir), cmd.join(" "), { mode: 0o600 });
+  fs.writeFileSync(startedFile(dir), now, { mode: 0o600 });
 
   setupScrollRegion();
 
