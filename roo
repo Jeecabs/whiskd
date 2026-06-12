@@ -6,7 +6,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const VERSION = "1.0.1";
+const VERSION = "2.0.0";
 
 // Per-user state dir. Deliberately /tmp, not os.tmpdir(): on macOS $TMPDIR
 // differs between GUI and SSH sessions, which would split state in two.
@@ -342,14 +342,21 @@ function pidIdentityOk(dir, pid) {
 }
 
 // ── Killing ──
-// Unlink-first protocol: whoever wins the pid-file unlink owns the exit
-// footer, so concurrent roo invocations never write duplicate footers.
+// Claim-first protocol: whoever claims the pid file owns the exit footer,
+// so concurrent roo invocations never write duplicate footers. The claim is
+// a rename, not an unlink: on macOS, racing unlink(2) calls can ALL report
+// success, but rename(2) hands the entry to exactly one claimer (verified
+// empirically — see the 2.0 review). A claim file left by a crash is inert
+// (nothing reads it) and the next claim's rename replaces it.
 
 function markDead(name, dir, footer) {
-  try { fs.unlinkSync(pidFile(dir)); } catch { return false; }
+  const pf = pidFile(dir);
+  const claim = pf + ".reaped";
+  try { fs.renameSync(pf, claim); } catch { return false; }
   const log = logFile(dir);
   try { fs.appendFileSync(log, `\n[roo:${name}] ${footer}\n`, { mode: 0o600 }); } catch {}
   truncateLog(log);
+  try { fs.unlinkSync(claim); } catch {}
   return true;
 }
 
