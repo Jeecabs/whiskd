@@ -16,6 +16,34 @@ const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_PAUSE_BYTES = 2 * 1024 * 1024;  // cap pause buffers so paused noisy children can't eat RSS
 const LOG_TAIL_BYTES = 256 * 1024;        // window when tailing logs for display
 
+// ── Terminal restore safety net ──
+// Every TUI registers a restore fn here and deregisters it on clean teardown.
+// Signals, uncaught exceptions, and normal exit all run the registered fns,
+// so a dying roo never leaves the terminal in raw mode / alt screen / a
+// scroll region.
+
+const restoreFns = new Set();
+
+function registerRestore(fn) { restoreFns.add(fn); return fn; }
+function unregisterRestore(fn) { restoreFns.delete(fn); }
+function runRestores() {
+  for (const fn of restoreFns) {
+    try { fn(); } catch {}
+  }
+  restoreFns.clear();
+}
+
+process.on("exit", runRestores);
+// Handlers must exit themselves: installing them cancels default termination.
+process.on("SIGINT", () => process.exit(130));
+process.on("SIGTERM", () => process.exit(143));
+process.on("SIGHUP", () => process.exit(129));
+process.on("uncaughtException", (err) => {
+  runRestores();
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+
 function killTree(pid) {
   try { process.kill(-pid, "SIGTERM"); } catch {}
   try { process.kill(pid, "SIGTERM"); } catch {}
@@ -309,6 +337,11 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
 
   setupScrollRegion();
 
+  const restoreAttach = registerRestore(() => {
+    resetTerminal();
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+  });
+
   const existing = readLogTail(log);
   const rows = process.stdout.rows || 24;
   const recentLines = existing.split("\n").slice(-(rows - 5));
@@ -360,6 +393,7 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
     clearInterval(statusPoll);
     clearInterval(barTick);
     resetTerminal();
+    unregisterRestore(restoreAttach);
     process.stdin.removeListener("data", attachKeyHandler);
     process.stdout.removeListener("resize", attachResizeHandler);
   }
@@ -743,16 +777,24 @@ else if (sub === "top") {
     renderTop();
   }
 
+  const restoreTop = () => {
+    process.stdout.write("\x1b[?25h");
+    process.stdout.write("\x1b[?1049l");
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+  };
+
   function cleanupTop() {
     clearInterval(topInterval);
     process.stdout.write("\x1b[?25h");
     process.stdout.write("\x1b[?1049l");
+    unregisterRestore(restoreTop);
     process.stdin.removeListener("data", topKeyHandler);
     process.stdout.removeListener("resize", topResizeHandler);
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
   }
 
   function returnToTop() {
+    registerRestore(restoreTop);
     process.stdout.write("\x1b[?1049h");
     process.stdout.write("\x1b[?25l");
     if (process.stdin.isTTY) {
@@ -819,6 +861,7 @@ else if (sub === "top") {
       process.stdout.removeListener("resize", topResizeHandler);
       process.stdout.write("\x1b[?25h");
       process.stdout.write("\x1b[?1049l");
+      unregisterRestore(restoreTop);
       runAttach(selected, () => {
         returnToTop();
       }, { safeQuit: true });
@@ -857,6 +900,7 @@ else if (sub === "top") {
   }
 
   // Entry
+  registerRestore(restoreTop);
   process.stdout.write("\x1b[?1049h");
   process.stdout.write("\x1b[?25l");
   process.stdin.setRawMode(true);
@@ -955,6 +999,11 @@ else {
 
   setupScrollRegion();
 
+  const restoreFg = registerRestore(() => {
+    resetTerminal();
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+  });
+
   const fgStartTime = Date.now();
   let fgPaused = false;
   let fgPauseBuf = [];
@@ -998,6 +1047,7 @@ else {
         clearInterval(fgBarTick);
         const finish = () => {
           resetTerminal();
+          unregisterRestore(restoreFg);
           process.stdin.setRawMode(false);
           try { fs.unlinkSync(pidFile(dir)); } catch {}
           logStream.end();
@@ -1017,6 +1067,7 @@ else {
         // d = detach (leave running)
         clearInterval(fgBarTick);
         resetTerminal();
+        unregisterRestore(restoreFg);
         process.stdin.setRawMode(false);
         child.unref();
         logStream.end();
@@ -1042,6 +1093,7 @@ else {
   child.on("close", (code) => {
     clearInterval(fgBarTick);
     resetTerminal();
+    unregisterRestore(restoreFg);
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     logStream.write(`\n[roo:${name}] exited with code ${code}\n`);
     try { fs.unlinkSync(pidFile(dir)); } catch {}
@@ -1055,6 +1107,7 @@ else {
   child.on("error", (err) => {
     clearInterval(fgBarTick);
     resetTerminal();
+    unregisterRestore(restoreFg);
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     try { fs.unlinkSync(pidFile(dir)); } catch {}
     console.error(`[roo:${name}] failed: ${err.message}`);
