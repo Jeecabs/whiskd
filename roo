@@ -641,7 +641,10 @@ function runAttach(proc, onReturn, { safeQuit = false, onKill = null } = {}) {
 
   const statusPoll = setInterval(() => {
     truncateLog(log); // keep the cap enforced during long attach sessions
-    if (!getPid(dir)) {
+    // Callers that pass onKill (fg) hold the child handle and learn about
+    // death from its close event — instantly and with the real exit code —
+    // so death detection here is only for plain attach.
+    if (!onKill && !getPid(dir)) {
       // Death discovered here means nobody else recorded it (or a stop
       // elsewhere already did, in which case markDead loses the unlink
       // race and writes nothing).
@@ -1231,155 +1234,87 @@ else if (sub === "start") {
 }
 
 // ── default: foreground TUI ──
+// fg spawns exactly like `start` — detached, with the child owning the log
+// fd — then attaches to its own process. Detach is just UI teardown, and a
+// dying roo can no longer kill or silence the child (it used to own the
+// child's pipes). Asymmetry kept on purpose: fg sets FORCE_COLOR=1 because
+// it's a terminal view; start sets 0.
 else {
   const { name: explicitName, rest } = parseNameFlag(process.argv.slice(2));
-  const cmd = rest;
-  const baseName = explicitName || deriveName(cmd);
+  if (rest.length === 0) {
+    console.error("usage: roo [--name <name>] <command...>");
+    process.exit(1);
+  }
+  const baseName = explicitName || deriveName(rest);
   const name = uniqueName(baseName);
   ensureProc(name);
   const dir = procDir(name);
 
-  const cmdStr = shellQuote(cmd);
+  const cmdStr = shellQuote(rest);
   const log = logFile(dir);
-  try { fs.unlinkSync(log); } catch {}
-  const logStream = fs.createWriteStream(log, { flags: "a", mode: 0o600 });
+  const logFd = openLog(log);
   const now = new Date().toISOString();
-  const writeLog = (str) => { logStream.write(str); };
-  writeLog(`[roo:${name}] started: ${cmdStr}\n`);
-  writeLog(`[roo:${name}] time: ${now}\n`);
-  writeLog(`[roo:${name}] ${"—".repeat(60)}\n`);
+  fs.writeSync(logFd, `[roo:${name}] started: ${cmdStr}\n[roo:${name}] time: ${now}\n[roo:${name}] ${"—".repeat(60)}\n`);
 
   const child = spawn(cmdStr, {
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["ignore", logFd, logFd],
     shell: true,
     detached: true,
     env: { ...process.env, FORCE_COLOR: "1" },
   });
+  fs.closeSync(logFd); // the child holds its own copies
 
+  child.on("error", (err) => {
+    try { fs.appendFileSync(log, `\n[roo:${name}] failed to start: ${err.message}\n`, { mode: 0o600 }); } catch {}
+    try { fs.unlinkSync(pidFile(dir)); } catch {}
+    runRestores();
+    console.error(`[roo:${name}] failed to start: ${err.message}`);
+    process.exit(1);
+  });
+
+  // pid is undefined when spawn itself failed; the "error" event above
+  // fires on the next tick and exits with the details.
   if (child.pid !== undefined) {
     writeProcState(dir, child.pid, cmdStr, now);
-  }
 
-  setupScrollRegion();
-
-  const restoreFg = registerRestore(() => {
-    resetTerminal();
-    if (process.stdin.isTTY) process.stdin.setRawMode(false);
-  });
-
-  const fgStartTime = Date.now();
-  let fgPaused = false;
-  let fgPauseBuf = [];
-  let fgPauseBufBytes = 0;
-  function fgPushPaused(chunk) {
-    fgPauseBuf.push(chunk);
-    fgPauseBufBytes += chunk.length;
-    while (fgPauseBufBytes > MAX_PAUSE_BYTES && fgPauseBuf.length > 1) {
-      fgPauseBufBytes -= fgPauseBuf.shift().length;
-    }
-  }
-
-  function fgBarText() {
-    const pause = fgPaused ? "  [PAUSED]" : "";
-    return `${name}  │  ${cmdStr}  │  pid ${child.pid}  │  ${formatUptime(fgStartTime)}${pause}  │  q/Ctrl+C: quit+kill  d: detach  p: pause`;
-  }
-  drawBar(fgBarText());
-
-  const fgBarTick = setInterval(() => drawBar(fgBarText()), 1000);
-
-  child.stdout.on("data", (data) => {
-    if (fgPaused) fgPushPaused(data);
-    else process.stdout.write(data);
-    writeLog(stripAnsi(data.toString()));
-  });
-
-  child.stderr.on("data", (data) => {
-    const colored = Buffer.from(`\x1b[2;31m${data}\x1b[0m`);
-    if (fgPaused) fgPushPaused(colored);
-    else process.stdout.write(colored);
-    writeLog(stripAnsi(data.toString()));
-  });
-
-  if (process.stdin.isTTY) {
-    process.stdin.setRawMode(true);
-    process.stdin.resume();
     let killing = false;
-    process.stdin.on("data", (key) => {
-      if (key[0] === 0x71 || key[0] === 0x03) {
-        // q or Ctrl+C: first press SIGTERMs and schedules SIGKILL, second press escalates now
-        clearInterval(fgBarTick);
-        const finish = () => {
-          resetTerminal();
-          unregisterRestore(restoreFg);
-          process.stdin.setRawMode(false);
-          try { fs.unlinkSync(pidFile(dir)); } catch {}
-          logStream.end();
-          console.log(`\n[roo:${name}] force killed`);
-          process.exit(1);
-        };
-        if (!killing) {
-          killing = true;
-          killTree(child.pid);
-          setTimeout(() => { forceKillTree(child.pid); finish(); }, 2000);
-        } else {
-          forceKillTree(child.pid);
-          finish();
-        }
-      }
-      if (key[0] === 0x64) {
-        // d = detach (leave running)
-        clearInterval(fgBarTick);
-        resetTerminal();
-        unregisterRestore(restoreFg);
-        process.stdin.setRawMode(false);
-        child.unref();
-        logStream.end();
+    let childCode = null;
+    let escalateTimer = null;
+
+    const attach = runAttach({ name, dir }, (reason) => {
+      if (reason === "detached") {
         console.log(`\n[roo:${name}] detached. still running.`);
         console.log(`  roo attach ${name}`);
         console.log(`  roo logs ${name}`);
         console.log(`  roo stop ${name}`);
         process.exit(0);
       }
-      if (key[0] === 0x70) {
-        // p = toggle pause
-        fgPaused = !fgPaused;
-        if (!fgPaused && fgPauseBuf.length > 0) {
-          for (const chunk of fgPauseBuf) process.stdout.write(chunk);
-          fgPauseBuf = [];
-          fgPauseBufBytes = 0;
-        }
-        drawBar(fgBarText());
+      if (killing) {
+        console.log(`\n[roo:${name}] killed`);
+        process.exit(1);
       }
+      console.log(`\n[roo:${name}] exited with code ${childCode}`);
+      process.exit(childCode ?? 1);
+    }, {
+      onKill: () => {
+        // First press SIGTERMs and schedules SIGKILL; second press escalates
+        // now. Teardown happens when the death lands in the close handler.
+        if (!killing) {
+          killing = true;
+          killTree(child.pid);
+          escalateTimer = setTimeout(() => forceKillTree(child.pid), 2000);
+        } else {
+          forceKillTree(child.pid);
+        }
+      },
+    });
+
+    child.on("close", (code) => {
+      childCode = code;
+      if (escalateTimer) clearTimeout(escalateTimer);
+      // Real exit footer; skipped if a concurrent stop already claimed it.
+      markDead(name, dir, `exited with code ${code}`);
+      attach.shutdown("exited"); // UI teardown + final drain + onReturn above
     });
   }
-
-  child.on("close", (code) => {
-    clearInterval(fgBarTick);
-    resetTerminal();
-    unregisterRestore(restoreFg);
-    if (process.stdin.isTTY) process.stdin.setRawMode(false);
-    logStream.write(`\n[roo:${name}] exited with code ${code}\n`);
-    try { fs.unlinkSync(pidFile(dir)); } catch {}
-    console.log(`\n[roo:${name}] exited with code ${code}`);
-    logStream.end(() => {
-      truncateLog(log);
-      process.exit(code ?? 1);
-    });
-  });
-
-  child.on("error", (err) => {
-    clearInterval(fgBarTick);
-    resetTerminal();
-    unregisterRestore(restoreFg);
-    if (process.stdin.isTTY) process.stdin.setRawMode(false);
-    try { fs.unlinkSync(pidFile(dir)); } catch {}
-    console.error(`[roo:${name}] failed: ${err.message}`);
-    logStream.end();
-    process.exit(1);
-  });
-
-  process.stdout.on("resize", () => {
-    setupScrollRegion();
-    drawBar(fgBarText());
-  });
 }
