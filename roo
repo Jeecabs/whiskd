@@ -175,6 +175,32 @@ function sanitize(name) {
   return name.replace(/[^a-zA-Z0-9_-]/g, "-").toLowerCase().slice(0, 30);
 }
 
+// ── Shell quoting ──
+// A single arg is passed raw so `roo start "npm run build && npm start"`
+// keeps its shell semantics. Multiple args are quoted per-arg so the
+// grouping the user's shell already resolved survives the inner shell.
+
+const SAFE_ARG = /^[A-Za-z0-9_\-./:=@%+]+$/;
+
+function quoteOne(s) {
+  if (s === "") return "''";
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+function quoteArg(a) {
+  if (SAFE_ARG.test(a)) return a;
+  // FOO=a b → FOO='a b': keep the assignment prefix outside the quotes so
+  // the shell still treats it as an env assignment.
+  const env = a.match(/^([A-Za-z_][A-Za-z0-9_]*=)([\s\S]*)$/);
+  if (env) return env[1] + quoteOne(env[2]);
+  return quoteOne(a);
+}
+
+function shellQuote(args) {
+  if (args.length === 1) return args[0];
+  return args.map(quoteArg).join(" ");
+}
+
 // ── Process helpers ──
 // All read helpers accept `dir` (absolute path to process directory).
 // `procDir(name)` is only used for creating new processes in the current cwd.
@@ -187,7 +213,21 @@ function startedFile(dir) { return path.join(dir, "started"); }
 
 function ensureProc(name) {
   const d = procDir(name);
-  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+  try {
+    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+  } catch (e) {
+    die(`cannot create process dir ${d}: ${e.message}`);
+  }
+}
+
+function writeProcState(dir, pid, cmdStr, startedIso) {
+  try {
+    fs.writeFileSync(pidFile(dir), String(pid), { mode: 0o600 });
+    fs.writeFileSync(cmdFile(dir), cmdStr, { mode: 0o600 });
+    fs.writeFileSync(startedFile(dir), startedIso, { mode: 0o600 });
+  } catch (e) {
+    die(`cannot write process state in ${dir}: ${e.message}`);
+  }
 }
 
 // Fresh log per run. Unlink first so a previous run's writer keeps its own
@@ -206,20 +246,34 @@ function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+// State files are plain text on disk; scrub escape/control chars on every
+// read so a tampered or corrupted file can't inject sequences into the
+// terminal via status lines, bar text, or top rows.
+function cleanMetaText(text) {
+  return stripAnsi(text).replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+}
+
+// Log text shown by `roo logs` and top's log pane: drop ANSI and control
+// chars but keep tabs, newlines, and carriage returns.
+function cleanLogText(text) {
+  return stripAnsi(text).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+}
+
 function getPid(dir) {
   try {
     const pid = parseInt(fs.readFileSync(pidFile(dir), "utf8").trim());
+    if (isNaN(pid) || pid <= 1) return null; // garbage, 0/negative (process groups), or init
     return pidAlive(pid) ? pid : null;
   } catch { return null; }
 }
 
 function getCmd(dir) {
-  try { return fs.readFileSync(cmdFile(dir), "utf8").trim(); }
+  try { return cleanMetaText(fs.readFileSync(cmdFile(dir), "utf8")); }
   catch { return "?"; }
 }
 
 function getStarted(dir) {
-  try { return fs.readFileSync(startedFile(dir), "utf8").trim(); }
+  try { return cleanMetaText(fs.readFileSync(startedFile(dir), "utf8")); }
   catch { return "?"; }
 }
 
@@ -348,8 +402,12 @@ function colorizeRow(line, running, hasDir) {
 // ── Resolve name: explicit arg, or pick the only running one, or error ──
 
 function resolveName(explicit) {
-  if (explicit && !["--help", "-h"].includes(explicit))
-    return { name: explicit, dir: procDir(explicit) };
+  if (explicit && !["--help", "-h"].includes(explicit)) {
+    // Stored names are always sanitized at creation; sanitize the lookup too
+    // so `roo logs MyAPI` finds the proc that was stored as `myapi`.
+    const name = sanitize(explicit);
+    return { name, dir: procDir(name) };
+  }
   const procs = allProcs();
   const running = procs.filter((p) => getPid(p.dir));
   if (running.length === 1) return running[0];
@@ -661,7 +719,7 @@ else if (sub === "logs") {
   if (!proc) { console.log("no processes"); process.exit(0); }
   const log = logFile(proc.dir);
   if (!fs.existsSync(log)) { console.log(`${proc.name}: no logs yet`); process.exit(0); }
-  const lines = readLogTail(log).split("\n");
+  const lines = cleanLogText(readLogTail(log)).split("\n");
   console.log(lines.slice(Math.max(0, lines.length - n)).join("\n"));
   process.exit(0);
 }
@@ -682,19 +740,13 @@ else if (sub === "top") {
   let logsLines = [];
   let logsScroll = 0;
 
-  const procMetaCache = new Map();
   function refreshProcList() {
     const procs = topGlobal ? allProcsGlobal() : allProcs();
     return procs.map((p) => {
-      let meta = procMetaCache.get(p.dir);
-      if (!meta) {
-        const started = getStarted(p.dir);
-        meta = {
-          cmd: getCmd(p.dir),
-          startMs: started !== "?" ? new Date(started).getTime() : null,
-        };
-        procMetaCache.set(p.dir, meta);
-      }
+      // Re-read cmd/started each tick: a name can be reused by a new process
+      // between ticks, and N is small enough that caching isn't worth staleness.
+      const started = getStarted(p.dir);
+      const startMs = started !== "?" ? new Date(started).getTime() : null;
       const pid = getPid(p.dir);
       return {
         name: p.name,
@@ -702,8 +754,8 @@ else if (sub === "top") {
         cwd: p.cwd || null,
         running: !!pid,
         pid: pid || null,
-        uptime: pid && meta.startMs ? formatUptime(meta.startMs) : null,
-        cmd: meta.cmd,
+        uptime: pid && startMs ? formatUptime(startMs) : null,
+        cmd: getCmd(p.dir),
       };
     }).sort((a, b) => {
       if (a.running !== b.running) return a.running ? -1 : 1;
@@ -807,7 +859,9 @@ else if (sub === "top") {
     logsName = proc.name;
     logsScroll = 0;
     const log = logFile(proc.dir);
-    const tail = readLogTail(log, 1024 * 1024);
+    // Strip at load, not at render: renderLogs slices lines by column width
+    // and would bisect escape sequences.
+    const tail = cleanLogText(readLogTail(log, 1024 * 1024));
     logsLines = tail ? tail.split("\n") : ["(no logs)"];
     renderLogs();
   }
@@ -979,37 +1033,47 @@ else if (sub === "start") {
   ensureProc(name);
   const dir = procDir(name);
 
+  const cmdStr = shellQuote(rest);
   const log = logFile(dir);
   const logFd = openLog(log);
   const now = new Date().toISOString();
-  const header = `[roo:${name}] started: ${rest.join(" ")}\n[roo:${name}] time: ${now}\n[roo:${name}] ${"—".repeat(60)}\n`;
+  const header = `[roo:${name}] started: ${cmdStr}\n[roo:${name}] time: ${now}\n[roo:${name}] ${"—".repeat(60)}\n`;
   fs.writeSync(logFd, header);
 
-  const child = spawn(rest.join(" "), {
+  const child = spawn(cmdStr, {
     stdio: ["ignore", logFd, logFd],
     shell: true,
     detached: true,
     env: { ...process.env, FORCE_COLOR: "0" },
   });
 
-  fs.writeFileSync(pidFile(dir), String(child.pid), { mode: 0o600 });
-  fs.writeFileSync(cmdFile(dir), rest.join(" "), { mode: 0o600 });
-  fs.writeFileSync(startedFile(dir), now, { mode: 0o600 });
-  child.unref();
-
-  console.log(`started  name=${name}  pid=${child.pid}`);
-  console.log(`logs     ${log}`);
-  console.log(`\n  roo attach ${name}`);
-  console.log(`  roo logs ${name}`);
-  console.log(`  roo stop ${name}`);
-
-  child.on("close", (code) => {
-    fs.appendFileSync(log, `\n[roo:${name}] exited with code ${code}\n`, { mode: 0o600 });
-    truncateLog(log);
+  child.on("error", (err) => {
+    try { fs.appendFileSync(log, `\n[roo:${name}] failed to start: ${err.message}\n`, { mode: 0o600 }); } catch {}
     try { fs.unlinkSync(pidFile(dir)); } catch {}
+    console.error(`[roo:${name}] failed to start: ${err.message}`);
+    process.exit(1);
   });
 
-  setTimeout(() => process.exit(0), 300);
+  // pid is undefined when spawn itself failed; the "error" event above
+  // fires on the next tick and exits with the details.
+  if (child.pid !== undefined) {
+    writeProcState(dir, child.pid, cmdStr, now);
+    child.unref();
+
+    console.log(`started  name=${name}  pid=${child.pid}`);
+    console.log(`logs     ${log}`);
+    console.log(`\n  roo attach ${name}`);
+    console.log(`  roo logs ${name}`);
+    console.log(`  roo stop ${name}`);
+
+    child.on("close", (code) => {
+      fs.appendFileSync(log, `\n[roo:${name}] exited with code ${code}\n`, { mode: 0o600 });
+      truncateLog(log);
+      try { fs.unlinkSync(pidFile(dir)); } catch {}
+    });
+
+    setTimeout(() => process.exit(0), 300);
+  }
 }
 
 // ── default: foreground TUI ──
@@ -1021,25 +1085,26 @@ else {
   ensureProc(name);
   const dir = procDir(name);
 
+  const cmdStr = shellQuote(cmd);
   const log = logFile(dir);
   try { fs.unlinkSync(log); } catch {}
   const logStream = fs.createWriteStream(log, { flags: "a", mode: 0o600 });
   const now = new Date().toISOString();
   const writeLog = (str) => { logStream.write(str); };
-  writeLog(`[roo:${name}] started: ${cmd.join(" ")}\n`);
+  writeLog(`[roo:${name}] started: ${cmdStr}\n`);
   writeLog(`[roo:${name}] time: ${now}\n`);
   writeLog(`[roo:${name}] ${"—".repeat(60)}\n`);
 
-  const child = spawn(cmd.join(" "), {
+  const child = spawn(cmdStr, {
     stdio: ["ignore", "pipe", "pipe"],
     shell: true,
     detached: true,
     env: { ...process.env, FORCE_COLOR: "1" },
   });
 
-  fs.writeFileSync(pidFile(dir), String(child.pid), { mode: 0o600 });
-  fs.writeFileSync(cmdFile(dir), cmd.join(" "), { mode: 0o600 });
-  fs.writeFileSync(startedFile(dir), now, { mode: 0o600 });
+  if (child.pid !== undefined) {
+    writeProcState(dir, child.pid, cmdStr, now);
+  }
 
   setupScrollRegion();
 
@@ -1062,7 +1127,7 @@ else {
 
   function fgBarText() {
     const pause = fgPaused ? "  [PAUSED]" : "";
-    return `${name}  │  ${cmd.join(" ")}  │  pid ${child.pid}  │  ${formatUptime(fgStartTime)}${pause}  │  q/Ctrl+C: quit+kill  d: detach  p: pause`;
+    return `${name}  │  ${cmdStr}  │  pid ${child.pid}  │  ${formatUptime(fgStartTime)}${pause}  │  q/Ctrl+C: quit+kill  d: detach  p: pause`;
   }
   drawBar(fgBarText());
 
