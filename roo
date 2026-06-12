@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const { stripVTControlCharacters: stripAnsi } = require("util");
 const fs = require("fs");
 const os = require("os");
@@ -277,6 +277,92 @@ function getStarted(dir) {
   catch { return "?"; }
 }
 
+// ── PID identity ──
+// A pid file can outlive its process, and the OS can hand the same pid to an
+// unrelated program. Before acting on a "live" pid, compare the process start
+// time from `ps` against the time we recorded; >60s apart means it isn't our
+// process. Display paths skip this on purpose — only kill/reconcile pay for it.
+
+let psCache = null; // { at, map: pid → approx start ms }
+
+function parseEtime(s) {
+  // ps etime formats: mm:ss / hh:mm:ss / dd-hh:mm:ss
+  const m = s.match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+  if (!m) return null;
+  return ((parseInt(m[1] || "0") * 24 + parseInt(m[2] || "0")) * 60 + parseInt(m[3])) * 60 + parseInt(m[4]);
+}
+
+function loadPsStarts() {
+  const now = Date.now();
+  if (psCache && now - psCache.at < 5000) return psCache.map;
+  const map = new Map();
+  try {
+    const out = spawnSync("ps", ["-axo", "pid=,etime="], { encoding: "utf8" });
+    if (out.status === 0 && out.stdout) {
+      for (const line of out.stdout.split("\n")) {
+        const m = line.match(/^\s*(\d+)\s+(\S+)/);
+        if (!m) continue;
+        const sec = parseEtime(m[2]);
+        if (sec !== null) map.set(parseInt(m[1]), now - sec * 1000);
+      }
+    }
+  } catch {}
+  psCache = { at: now, map };
+  return map;
+}
+
+function pidIdentityOk(dir, pid) {
+  const started = getStarted(dir);
+  if (started === "?") return true; // nothing recorded → trust (old behavior)
+  const recordedMs = new Date(started).getTime();
+  if (isNaN(recordedMs)) return true;
+  const starts = loadPsStarts();
+  if (starts.size === 0) return true; // ps unavailable → trust
+  const psMs = starts.get(pid);
+  if (psMs === undefined) return true; // died since the alive check → acting on it is harmless
+  return Math.abs(psMs - recordedMs) < 60 * 1000;
+}
+
+// ── Killing ──
+// Unlink-first protocol: whoever wins the pid-file unlink owns the exit
+// footer, so concurrent roo invocations never write duplicate footers.
+
+function markDead(name, dir, footer) {
+  try { fs.unlinkSync(pidFile(dir)); } catch { return false; }
+  const log = logFile(dir);
+  try { fs.appendFileSync(log, `\n[roo:${name}] ${footer}\n`, { mode: 0o600 }); } catch {}
+  truncateLog(log);
+  return true;
+}
+
+// SIGTERM the whole tree, poll every 100ms, SIGKILL survivors at 2s.
+// Exits as soon as everything is dead instead of burning a fixed timer.
+function killProcs(entries, { silent = false } = {}, onDone) {
+  for (const e of entries) killTree(e.pid);
+  const deadline = Date.now() + 2000;
+  let escalated = false;
+  const tick = setInterval(() => {
+    const alive = entries.filter((e) => pidAlive(e.pid));
+    if (alive.length === 0) {
+      clearInterval(tick);
+      for (const e of entries) markDead(e.name, e.dir, "stopped");
+      onDone();
+    } else if (!escalated && Date.now() >= deadline) {
+      escalated = true;
+      for (const e of alive) {
+        forceKillTree(e.pid);
+        if (!silent) console.log(`force killed ${e.name}`);
+      }
+    } else if (escalated && Date.now() >= deadline + 1000) {
+      // Survived SIGKILL (uninterruptible sleep) — clean up state and move on.
+      clearInterval(tick);
+      for (const e of entries) markDead(e.name, e.dir, "stopped");
+      if (!silent) for (const e of alive) console.log(`warning: ${e.name} (pid ${e.pid}) did not die`);
+      onDone();
+    }
+  }, 100);
+}
+
 function allProcs() {
   try {
     return fs.readdirSync(ROO_DIR, { withFileTypes: true })
@@ -518,11 +604,16 @@ function runAttach(proc, onReturn, { safeQuit = false } = {}) {
     if (key[0] === 0x03 || (!safeQuit && key[0] === 0x71)) {
       cleanupAttach();
       if (process.stdin.isTTY) process.stdin.setRawMode(false);
-      killTree(pid);
-      try { fs.unlinkSync(pidFile(dir)); } catch {}
-      setTimeout(() => forceKillTree(pid), 2000);
-      console.log(`\n[roo:${name}] killed`);
-      process.exit(0);
+      if (!pidIdentityOk(dir, pid)) {
+        markDead(name, dir, "exited (status unknown)");
+        console.log(`\n[roo:${name}] already exited (stale pid)`);
+        process.exit(0);
+      }
+      killProcs([{ name, dir, pid }], {}, () => {
+        console.log(`\n[roo:${name}] killed`);
+        process.exit(0);
+      });
+      return;
     }
     // d: detach (leave running)
     if (key[0] === 0x64) {
@@ -647,26 +738,23 @@ if (sub === "stop") {
 
   if (arg === "--all") {
     const procs = allProcs();
-    const killed = [];
+    const entries = [];
     for (const { name, dir } of procs) {
       const pid = getPid(dir);
-      if (pid) {
-        try { process.kill(pid, "SIGTERM"); } catch {}
-        console.log(`stopped  ${name}  pid=${pid}`);
-        killed.push({ name, dir, pid });
+      if (!pid) continue;
+      if (!pidIdentityOk(dir, pid)) {
+        markDead(name, dir, "exited (status unknown)");
+        console.log(`${name}: pid ${pid} belongs to another process — cleaned up stale state`);
+        continue;
       }
+      console.log(`stopped  ${name}  pid=${pid}`);
+      entries.push({ name, dir, pid });
     }
-    if (killed.length === 0) console.log("nothing running");
-    setTimeout(() => {
-      for (const { name, dir, pid } of killed) {
-        if (pidAlive(pid)) {
-          try { process.kill(pid, "SIGKILL"); } catch {}
-          console.log(`force killed ${name}`);
-        }
-        try { fs.unlinkSync(pidFile(dir)); } catch {}
-      }
+    if (entries.length === 0) {
+      console.log("nothing running");
       process.exit(0);
-    }, 1500);
+    }
+    killProcs(entries, {}, () => process.exit(0));
     return;
   }
 
@@ -674,16 +762,13 @@ if (sub === "stop") {
   if (!proc) { console.log("nothing running"); process.exit(0); }
   const pid = getPid(proc.dir);
   if (!pid) { console.log(`${proc.name}: not running`); process.exit(0); }
-  try { process.kill(pid, "SIGTERM"); } catch {}
-  console.log(`stopped  ${proc.name}  pid=${pid}`);
-  setTimeout(() => {
-    if (pidAlive(pid)) {
-      try { process.kill(pid, "SIGKILL"); } catch {}
-      console.log(`force killed ${proc.name}`);
-    }
-    try { fs.unlinkSync(pidFile(proc.dir)); } catch {}
+  if (!pidIdentityOk(proc.dir, pid)) {
+    markDead(proc.name, proc.dir, "exited (status unknown)");
+    console.log(`${proc.name}: not running (pid ${pid} belongs to another process — cleaned up stale state)`);
     process.exit(0);
-  }, 1500);
+  }
+  console.log(`stopped  ${proc.name}  pid=${pid}`);
+  killProcs([{ name: proc.name, dir: proc.dir, pid }], {}, () => process.exit(0));
 }
 
 // ── clean ──
@@ -969,7 +1054,13 @@ else if (sub === "top") {
       if (procList.length === 0) return;
       const selected = procList[topCursor];
       if (!selected.running) return;
-      try { process.kill(selected.pid, "SIGTERM"); } catch {}
+      if (!pidIdentityOk(selected.dir, selected.pid)) {
+        markDead(selected.name, selected.dir, "exited (status unknown)");
+      } else {
+        // Runs on top's event loop; if the user quits before escalation
+        // fires, the next invocation's reconcile cleans up.
+        killProcs([{ name: selected.name, dir: selected.dir, pid: selected.pid }], { silent: true }, () => {});
+      }
       procList = refreshProcList();
       renderTop();
       return;
