@@ -7,13 +7,26 @@ description: Use whiskd to run, monitor, attach to, log, and stop long-running l
 
 ## Install / run
 
-Install the skill:
+Install the CLI before use:
+
+```sh
+npm install -g github:Jeecabs/whiskd
+whiskd status
+```
+
+After npm publish, prefer:
+
+```sh
+npm install -g whiskd
+```
+
+Install this skill separately if needed:
 
 ```sh
 npx skills add Jeecabs/whiskd
 ```
 
-Install the CLI before use:
+Local checkout install:
 
 ```sh
 git clone https://github.com/Jeecabs/whiskd.git

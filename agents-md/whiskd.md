@@ -17,13 +17,26 @@ Core files:
 
 ## Install / invoke from agents
 
-Install the agent skill with skills.sh:
+Install the CLI before use:
+
+```sh
+npm install -g github:Jeecabs/whiskd
+whiskd status
+```
+
+After npm publish, prefer:
+
+```sh
+npm install -g whiskd
+```
+
+Optional: install the agent skill with skills.sh:
 
 ```sh
 npx skills add Jeecabs/whiskd
 ```
 
-Install the CLI locally before use:
+Local checkout install:
 
 ```sh
 git clone https://github.com/Jeecabs/whiskd.git
