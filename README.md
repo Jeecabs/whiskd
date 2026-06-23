@@ -8,13 +8,41 @@ Lightweight process wrapper with a TUI status bar. Run, background, attach, and 
 
 ## Install
 
-Install the agent skill with skills.sh:
+Requires Node.js 18+.
+
+### CLI
+
+Install from GitHub:
+
+```sh
+npm install -g github:Jeecabs/whiskd
+```
+
+After npm publish, install from npm:
+
+```sh
+npm install -g whiskd
+```
+
+Then run:
+
+```sh
+whiskd status
+```
+
+Do not run `whiskd` via `npx github:Jeecabs/whiskd ...`. `whiskd` manages long-running processes and needs a stable local binary/path for reliable monitoring, attach, and stop behavior.
+
+### Agent skill
+
+Install the optional agent skill with skills.sh:
 
 ```sh
 npx skills add Jeecabs/whiskd
 ```
 
-Install the CLI locally to `~/bin`:
+### Local checkout
+
+For local development, or if you prefer a plain `~/bin` install:
 
 ```sh
 git clone https://github.com/Jeecabs/whiskd.git
@@ -27,10 +55,6 @@ Make sure `~/bin` is in your `PATH`:
 ```sh
 export PATH=$HOME/bin:$PATH
 ```
-
-Requires Node.js 18+.
-
-Do not run `whiskd` via `npx github:Jeecabs/whiskd ...`. `whiskd` manages long-running processes and needs a stable local binary/path for reliable monitoring, attach, and stop behavior.
 
 ## Usage
 
