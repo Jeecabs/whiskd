@@ -1,13 +1,13 @@
 {
-  "name": "roo-process-manager",
-  "version": "2.0.0",
+  "name": "whiskd",
+  "version": "3.0.0",
   "description": "Lightweight process wrapper with a TUI status bar for agents and humans.",
   "bin": {
-    "roo": "./roo"
+    "whiskd": "./whiskd"
   },
   "scripts": {
-    "check": "node --check roo",
-    "smoke": "node --check roo && node roo status --json"
+    "check": "node --check whiskd",
+    "smoke": "node --check whiskd && node whiskd status --json"
   },
   "keywords": [
     "agents",
