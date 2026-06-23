@@ -1,12 +1,12 @@
 #!/bin/bash
-# Install roo to ~/bin
+# Install whiskd to ~/bin
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DEST="$HOME/bin/roo"
+DEST="$HOME/bin/whiskd"
 
 mkdir -p "$HOME/bin"
-cp "$SCRIPT_DIR/roo" "$DEST"
+cp "$SCRIPT_DIR/whiskd" "$DEST"
 chmod +x "$DEST"
 
-echo "installed roo → $DEST"
+echo "installed whiskd → $DEST"

@@ -1,4 +1,8 @@
-# roo
+# whiskd
+
+<p align="center">
+  <img src="assets/whiskd-logo.png" alt="whiskd tabby cat mascot" width="220">
+</p>
 
 Lightweight process wrapper with a TUI status bar. Run, background, attach, and manage long-running commands with automatic log capture.
 
@@ -7,14 +11,14 @@ Lightweight process wrapper with a TUI status bar. Run, background, attach, and 
 Install the agent skill with skills.sh:
 
 ```sh
-npx skills add Jeecabs/roo
+npx skills add Jeecabs/whiskd
 ```
 
 Install the CLI locally to `~/bin`:
 
 ```sh
-git clone https://github.com/Jeecabs/roo.git
-cd roo
+git clone https://github.com/Jeecabs/whiskd.git
+cd whiskd
 ./install.sh
 ```
 
@@ -26,41 +30,41 @@ export PATH=$HOME/bin:$PATH
 
 Requires Node.js 18+.
 
-Do not run `roo` via `npx github:Jeecabs/roo ...`. `roo` manages long-running processes and needs a stable local binary/path for reliable monitoring, attach, and stop behavior.
+Do not run `whiskd` via `npx github:Jeecabs/whiskd ...`. `whiskd` manages long-running processes and needs a stable local binary/path for reliable monitoring, attach, and stop behavior.
 
 ## Usage
 
 ```sh
 # Run with TUI (foreground)
-roo npm run dev
+whiskd npm run dev
 
 # Run in background
-roo start npm run dev
+whiskd start npm run dev
 
 # Named process
-roo start --name api node server.js
+whiskd start --name api node server.js
 
 # Check what's running
-roo status
-roo status --json
+whiskd status
+whiskd status --json
 
 # Live dashboard
-roo top
-roo top --global    # all directories
+whiskd top
+whiskd top --global    # all directories
 
 # View logs (last 40 lines by default)
-roo logs
-roo logs api 100
+whiskd logs
+whiskd logs api 100
 
 # Attach to a background process
-roo attach api
+whiskd attach api
 
 # Stop
-roo stop api
-roo stop --all
+whiskd stop api
+whiskd stop --all
 
 # Clean up stopped process dirs
-roo clean
+whiskd clean
 ```
 
 ## TUI keys (foreground/attach)
@@ -96,23 +100,27 @@ Use `--name` / `-n` to override.
 
 ## Logs
 
-Logs are stored in `/tmp/roo-<uid>/<cwd>/<name>/output.log` (a private, per-user directory with `0700` permissions; state files and logs are `0600`).
+Logs are stored in `/tmp/whiskd-<uid>/<cwd>/<name>/output.log` (a private, per-user directory with `0700` permissions; state files and logs are `0600`).
 
-Log files keep ANSI color codes; `roo logs` and top's log pane strip them for display, while `attach` and the foreground TUI show them raw (it's a live terminal view). The foreground TUI runs commands with `FORCE_COLOR=1`; `roo start` uses `FORCE_COLOR=0`.
+Log files keep ANSI color codes; `whiskd logs` and top's log pane strip them for display, while `attach` and the foreground TUI show them raw (it's a live terminal view). The foreground TUI runs commands with `FORCE_COLOR=1`; `whiskd start` uses `FORCE_COLOR=0`.
 
-Logs are capped at 10MB — enforced when a process exits and whenever any roo command runs, and checked continuously while `top` or `attach` are open. Old process dirs are pruned after 7 days. When roo discovers a death after the fact (the usual case for `roo start`), it appends an `exited (status unknown)` footer to the log.
+Logs are capped at 10MB — enforced when a process exits and whenever any whiskd command runs, and checked continuously while `top` or `attach` are open. Old process dirs are pruned after 7 days. When whiskd discovers a death after the fact (the usual case for `whiskd start`), it appends an `exited (status unknown)` footer to the log.
 
 ## Command quoting
 
-Multi-argument commands are quoted per-argument, so `roo echo 'a  b'` preserves the grouping your shell resolved, and env prefixes like `FOO='x y' cmd` stay assignments. A single-argument command string is passed raw to the shell:
+Multi-argument commands are quoted per-argument, so `whiskd echo 'a  b'` preserves the grouping your shell resolved, and env prefixes like `FOO='x y' cmd` stay assignments. A single-argument command string is passed raw to the shell:
 
 ```sh
-roo start "npm run build && npm start"   # shell operators work
-roo printf '%s\n' 'a b' c                # arguments survive intact
+whiskd start "npm run build && npm start"   # shell operators work
+whiskd printf '%s\n' 'a b' c                # arguments survive intact
 ```
+
+## Changed in 3.0
+
+- **Renamed to `whiskd`** across the package, CLI binary, docs, agent skill, log prefixes, and state directory.
+- **State lives under `/tmp/whiskd-<uid>`**. Existing process state under older names is not read.
 
 ## Changed in 2.0
 
-- **State moved** from the shared `/tmp/roo` to per-user `/tmp/roo-<uid>` (also reflected in `status --json`'s `log` field). Processes started by 1.x are invisible to 2.x: stop them with the old binary (or `kill` them manually), then `rm -rf /tmp/roo`.
-- **Foreground mode spawns like `start`** and attaches to its own process. The child owns its log file, so detaching — or roo itself being killed — leaves it running and attachable. Trade-offs: stderr is no longer tinted red, output is displayed with up to ~100ms latency, and log files now retain ANSI (stripped on display).
-- **Multi-arg commands are shell-quoted per-arg** (see above). `roo echo a && echo b` no longer leaks `&&` to the inner shell — quote the whole thing as one argument if you want shell semantics.
+- **Foreground mode spawns like `start`** and attaches to its own process. The child owns its log file, so detaching — or whiskd itself being killed — leaves it running and attachable. Trade-offs: stderr is no longer tinted red, output is displayed with up to ~100ms latency, and log files now retain ANSI (stripped on display).
+- **Multi-arg commands are shell-quoted per-arg** (see above). `whiskd echo a && echo b` no longer leaks `&&` to the inner shell — quote the whole thing as one argument if you want shell semantics.

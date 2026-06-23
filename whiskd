@@ -6,12 +6,12 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const VERSION = "2.0.0";
+const VERSION = "3.0.0";
 
 // Per-user state dir. Deliberately /tmp, not os.tmpdir(): on macOS $TMPDIR
 // differs between GUI and SSH sessions, which would split state in two.
-const ROO_BASE = path.join("/tmp", "roo-" + (typeof process.getuid === "function" ? process.getuid() : "u"));
-const ROO_DIR = path.join(ROO_BASE, process.cwd());
+const WHISKD_BASE = path.join("/tmp", "whiskd-" + (typeof process.getuid === "function" ? process.getuid() : "u"));
+const WHISKD_DIR = path.join(WHISKD_BASE, process.cwd());
 
 const MAX_LOG_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -21,7 +21,7 @@ const LOG_TAIL_BYTES = 256 * 1024;        // window when tailing logs for displa
 // ── Terminal restore safety net ──
 // Every TUI registers a restore fn here and deregisters it on clean teardown.
 // Signals, uncaught exceptions, and normal exit all run the registered fns,
-// so a dying roo never leaves the terminal in raw mode / alt screen / a
+// so a dying whiskd never leaves the terminal in raw mode / alt screen / a
 // scroll region.
 
 const restoreFns = new Set();
@@ -71,7 +71,7 @@ function readLogTail(logPath, maxBytes = LOG_TAIL_BYTES) {
 }
 
 function die(msg) {
-  console.error(`roo: ${msg}`);
+  console.error(`whiskd: ${msg}`);
   process.exit(1);
 }
 
@@ -82,18 +82,18 @@ function die(msg) {
 let baseEnsured = false;
 function ensureBase() {
   if (baseEnsured) return;
-  try { fs.mkdirSync(ROO_BASE, { recursive: true, mode: 0o700 }); } catch {}
+  try { fs.mkdirSync(WHISKD_BASE, { recursive: true, mode: 0o700 }); } catch {}
   let st;
-  try { st = fs.lstatSync(ROO_BASE); } catch (e) {
-    die(`cannot create state dir ${ROO_BASE}: ${e.message}`);
+  try { st = fs.lstatSync(WHISKD_BASE); } catch (e) {
+    die(`cannot create state dir ${WHISKD_BASE}: ${e.message}`);
   }
   if (st.isSymbolicLink() || !st.isDirectory()) {
-    die(`state path ${ROO_BASE} is not a directory (possible tampering).\n  remove it with: rm -rf ${ROO_BASE}`);
+    die(`state path ${WHISKD_BASE} is not a directory (possible tampering).\n  remove it with: rm -rf ${WHISKD_BASE}`);
   }
   if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
-    die(`state dir ${ROO_BASE} is owned by uid ${st.uid}, not you (uid ${process.getuid()}).\n  remove it with: rm -rf ${ROO_BASE}`);
+    die(`state dir ${WHISKD_BASE} is owned by uid ${st.uid}, not you (uid ${process.getuid()}).\n  remove it with: rm -rf ${WHISKD_BASE}`);
   }
-  try { fs.chmodSync(ROO_BASE, 0o700); } catch {}
+  try { fs.chmodSync(WHISKD_BASE, 0o700); } catch {}
   baseEnsured = true;
 }
 
@@ -104,7 +104,7 @@ function ensureBase() {
 function housekeep() {
   ensureBase();
   const now = Date.now();
-  pruneOldDirs(ROO_BASE, now);
+  pruneOldDirs(WHISKD_BASE, now);
 }
 
 // The parent that would have written the exit footer often exits long before
@@ -166,7 +166,7 @@ function truncateLog(logPath) {
     const text = buf.toString();
     const firstNewline = text.indexOf("\n");
     const kept = firstNewline >= 0 ? text.slice(firstNewline + 1) : text;
-    fs.writeFileSync(logPath, `[roo] log truncated (exceeded ${MAX_LOG_BYTES / 1024 / 1024}MB)\n` + kept, { mode: 0o600 });
+    fs.writeFileSync(logPath, `[whiskd] log truncated (exceeded ${MAX_LOG_BYTES / 1024 / 1024}MB)\n` + kept, { mode: 0o600 });
   } catch {}
 }
 
@@ -194,7 +194,7 @@ function sanitize(name) {
 }
 
 // ── Shell quoting ──
-// A single arg is passed raw so `roo start "npm run build && npm start"`
+// A single arg is passed raw so `whiskd start "npm run build && npm start"`
 // keeps its shell semantics. Multiple args are quoted per-arg so the
 // grouping the user's shell already resolved survives the inner shell.
 
@@ -223,7 +223,7 @@ function shellQuote(args) {
 // All read helpers accept `dir` (absolute path to process directory).
 // `procDir(name)` is only used for creating new processes in the current cwd.
 
-function procDir(name) { return path.join(ROO_DIR, name); }
+function procDir(name) { return path.join(WHISKD_DIR, name); }
 function logFile(dir) { return path.join(dir, "output.log"); }
 function pidFile(dir) { return path.join(dir, "pid"); }
 function cmdFile(dir) { return path.join(dir, "cmd"); }
@@ -271,7 +271,7 @@ function cleanMetaText(text) {
   return stripAnsi(text).replace(/[\x00-\x1f\x7f]+/g, " ").trim();
 }
 
-// Log text shown by `roo logs` and top's log pane: drop ANSI and control
+// Log text shown by `whiskd logs` and top's log pane: drop ANSI and control
 // chars but keep tabs, newlines, and carriage returns.
 function cleanLogText(text) {
   return stripAnsi(text).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
@@ -343,7 +343,7 @@ function pidIdentityOk(dir, pid) {
 
 // ── Killing ──
 // Claim-first protocol: whoever claims the pid file owns the exit footer,
-// so concurrent roo invocations never write duplicate footers. The claim is
+// so concurrent whiskd invocations never write duplicate footers. The claim is
 // a rename, not an unlink: on macOS, racing unlink(2) calls can ALL report
 // success, but rename(2) hands the entry to exactly one claimer (verified
 // empirically — see the 2.0 review). A claim file left by a crash is inert
@@ -354,7 +354,7 @@ function markDead(name, dir, footer) {
   const claim = pf + ".reaped";
   try { fs.renameSync(pf, claim); } catch { return false; }
   const log = logFile(dir);
-  try { fs.appendFileSync(log, `\n[roo:${name}] ${footer}\n`, { mode: 0o600 }); } catch {}
+  try { fs.appendFileSync(log, `\n[whiskd:${name}] ${footer}\n`, { mode: 0o600 }); } catch {}
   truncateLog(log);
   try { fs.unlinkSync(claim); } catch {}
   return true;
@@ -390,9 +390,9 @@ function killProcs(entries, { silent = false } = {}, onDone) {
 
 function allProcs() {
   try {
-    return fs.readdirSync(ROO_DIR, { withFileTypes: true })
-      .filter((ent) => ent.isDirectory() && fs.existsSync(path.join(ROO_DIR, ent.name, "cmd")))
-      .map((ent) => ({ name: ent.name, dir: path.join(ROO_DIR, ent.name) }));
+    return fs.readdirSync(WHISKD_DIR, { withFileTypes: true })
+      .filter((ent) => ent.isDirectory() && fs.existsSync(path.join(WHISKD_DIR, ent.name, "cmd")))
+      .map((ent) => ({ name: ent.name, dir: path.join(WHISKD_DIR, ent.name) }));
   } catch { return []; }
 }
 
@@ -402,7 +402,7 @@ function allProcsGlobal() {
   function walk(dir) {
     if (fs.existsSync(path.join(dir, "cmd"))) {
       const name = path.basename(dir);
-      const cwdPath = path.dirname(dir).slice(ROO_BASE.length + 1);
+      const cwdPath = path.dirname(dir).slice(WHISKD_BASE.length + 1);
       const cwd = cwdPath.startsWith(home) ? "~" + cwdPath.slice(home.length) : "/" + cwdPath;
       results.push({ name, dir, cwd });
       return;
@@ -413,7 +413,7 @@ function allProcsGlobal() {
       }
     } catch {}
   }
-  if (fs.existsSync(ROO_BASE)) walk(ROO_BASE);
+  if (fs.existsSync(WHISKD_BASE)) walk(WHISKD_BASE);
   return results;
 }
 
@@ -515,7 +515,7 @@ function colorizeRow(line, running, hasDir) {
 function resolveName(explicit) {
   if (explicit && !["--help", "-h"].includes(explicit)) {
     // Stored names are always sanitized at creation; sanitize the lookup too
-    // so `roo logs MyAPI` finds the proc that was stored as `myapi`.
+    // so `whiskd logs MyAPI` finds the proc that was stored as `myapi`.
     const name = sanitize(explicit);
     return { name, dir: procDir(name) };
   }
@@ -675,12 +675,12 @@ function runAttach(proc, onReturn, { safeQuit = false, onKill = null } = {}) {
       if (!pidIdentityOk(dir, pid)) {
         markDead(name, dir, "exited (status unknown)");
         drainTail();
-        console.log(`\n[roo:${name}] already exited (stale pid)`);
+        console.log(`\n[whiskd:${name}] already exited (stale pid)`);
         process.exit(0);
       }
       killProcs([{ name, dir, pid }], {}, () => {
         drainTail();
-        console.log(`\n[roo:${name}] killed`);
+        console.log(`\n[whiskd:${name}] killed`);
         process.exit(0);
       });
       return;
@@ -721,22 +721,22 @@ function runAttach(proc, onReturn, { safeQuit = false, onKill = null } = {}) {
 const sub = process.argv[2];
 
 if (sub === "--version" || sub === "-v") {
-  console.log(`roo ${VERSION}`);
+  console.log(`whiskd ${VERSION}`);
   process.exit(0);
 }
 
 if (!sub || sub === "--help" || sub === "-h") {
-  console.log(`roo - lightweight process wrapper with TUI
+  console.log(`whiskd - lightweight process wrapper with TUI
 
-  roo <cmd...>                  run with TUI, auto-named
-  roo start <cmd...>            run in background, auto-named
-  roo start --name api <cmd>    run in background with explicit name
-  roo status [--json]            list all processes (--json for machine-readable)
-  roo top [--global]              live dashboard (--global/-g for all dirs)
-  roo logs [name] [n]           last n lines (default 40)
-  roo attach [name]             attach TUI to running process
-  roo stop [name]               stop a process (or all with --all)
-  roo clean                     remove stopped process dirs
+  whiskd <cmd...>                  run with TUI, auto-named
+  whiskd start <cmd...>            run in background, auto-named
+  whiskd start --name api <cmd>    run in background with explicit name
+  whiskd status [--json]            list all processes (--json for machine-readable)
+  whiskd top [--global]              live dashboard (--global/-g for all dirs)
+  whiskd logs [name] [n]           last n lines (default 40)
+  whiskd attach [name]             attach TUI to running process
+  whiskd stop [name]               stop a process (or all with --all)
+  whiskd clean                     remove stopped process dirs
 
 TUI keys (foreground/attach):
   q/Ctrl+C  kill process and exit (default)
@@ -756,11 +756,11 @@ Names are auto-derived from commands:
   npm run build → build    python app.py → app
 
 Multiple processes per directory:
-  roo start npm run dev                → dev
-  roo start npm run build              → build
-  roo start --name api npm run start   → api
+  whiskd start npm run dev                → dev
+  whiskd start npm run build              → build
+  whiskd start --name api npm run start   → api
 
-State and logs live in ${ROO_BASE}/<cwd>/<name>/output.log`);
+State and logs live in ${WHISKD_BASE}/<cwd>/<name>/output.log`);
   process.exit(0);
 }
 
@@ -854,16 +854,16 @@ else if (sub === "clean") {
     }
   }
   if (cleaned === 0) console.log("nothing to clean");
-  // Remove ROO_DIR if empty
-  if (fs.existsSync(ROO_DIR) && fs.readdirSync(ROO_DIR).length === 0) {
-    fs.rmSync(ROO_DIR, { recursive: true, force: true });
+  // Remove WHISKD_DIR if empty
+  if (fs.existsSync(WHISKD_DIR) && fs.readdirSync(WHISKD_DIR).length === 0) {
+    fs.rmSync(WHISKD_DIR, { recursive: true, force: true });
   }
   process.exit(0);
 }
 
 // ── logs ──
 else if (sub === "logs") {
-  // roo logs [name] [n]  — name is optional if only one proc
+  // whiskd logs [name] [n]  — name is optional if only one proc
   let nameArg = null;
   let n = 40;
   const args = process.argv.slice(3);
@@ -883,7 +883,7 @@ else if (sub === "logs") {
 // ── top ──
 else if (sub === "top") {
   if (!process.stdin.isTTY) {
-    console.error("roo top requires a terminal");
+    console.error("whiskd top requires a terminal");
     process.exit(1);
   }
 
@@ -931,7 +931,7 @@ else if (sub === "top") {
 
     process.stdout.write("\x1b[H");
 
-    const header = `roo top${scope} -- ${procList.length} process${procList.length !== 1 ? "es" : ""} (${runCount} running)`;
+    const header = `whiskd top${scope} -- ${procList.length} process${procList.length !== 1 ? "es" : ""} (${runCount} running)`;
     process.stdout.write("\x1b[2K" + header + "\n");
 
     const colHeader = topGlobal
@@ -943,7 +943,7 @@ else if (sub === "top") {
 
     const availRows = rows - 4;
     if (procList.length === 0) {
-      const msg = "no processes -- roo start <cmd> to begin";
+      const msg = "no processes -- whiskd start <cmd> to begin";
       const pad = Math.max(0, Math.floor((availRows - 1) / 2));
       for (let i = 0; i < availRows; i++) {
         process.stdout.write("\x1b[2K");
@@ -980,7 +980,7 @@ else if (sub === "top") {
 
     process.stdout.write("\x1b[H");
 
-    const header = `roo logs -- ${logsName}`;
+    const header = `whiskd logs -- ${logsName}`;
     process.stdout.write("\x1b[2K\x1b[1m" + header + "\x1b[0m\n");
     process.stdout.write("\x1b[2K\n");
 
@@ -1180,8 +1180,8 @@ else if (sub === "attach") {
   const pid = getPid(proc.dir);
   if (!pid) { console.log(`${proc.name}: not running`); process.exit(0); }
   runAttach(proc, (reason) => {
-    if (reason === "exited") console.log(`\n[roo:${proc.name}] process exited`);
-    else console.log(`\n[roo:${proc.name}] detached. still running.`);
+    if (reason === "exited") console.log(`\n[whiskd:${proc.name}] process exited`);
+    else console.log(`\n[whiskd:${proc.name}] detached. still running.`);
     process.exit(0);
   });
 }
@@ -1190,7 +1190,7 @@ else if (sub === "attach") {
 else if (sub === "start") {
   const { name: explicitName, rest } = parseNameFlag(process.argv.slice(3));
   if (rest.length === 0) {
-    console.error("usage: roo start [--name <n>] <command...>");
+    console.error("usage: whiskd start [--name <n>] <command...>");
     process.exit(1);
   }
   const baseName = explicitName || deriveName(rest);
@@ -1202,7 +1202,7 @@ else if (sub === "start") {
   const log = logFile(dir);
   const logFd = openLog(log);
   const now = new Date().toISOString();
-  const header = `[roo:${name}] started: ${cmdStr}\n[roo:${name}] time: ${now}\n[roo:${name}] ${"—".repeat(60)}\n`;
+  const header = `[whiskd:${name}] started: ${cmdStr}\n[whiskd:${name}] time: ${now}\n[whiskd:${name}] ${"—".repeat(60)}\n`;
   fs.writeSync(logFd, header);
 
   const child = spawn(cmdStr, {
@@ -1213,9 +1213,9 @@ else if (sub === "start") {
   });
 
   child.on("error", (err) => {
-    try { fs.appendFileSync(log, `\n[roo:${name}] failed to start: ${err.message}\n`, { mode: 0o600 }); } catch {}
+    try { fs.appendFileSync(log, `\n[whiskd:${name}] failed to start: ${err.message}\n`, { mode: 0o600 }); } catch {}
     try { fs.unlinkSync(pidFile(dir)); } catch {}
-    console.error(`[roo:${name}] failed to start: ${err.message}`);
+    console.error(`[whiskd:${name}] failed to start: ${err.message}`);
     process.exit(1);
   });
 
@@ -1227,9 +1227,9 @@ else if (sub === "start") {
 
     console.log(`started  name=${name}  pid=${child.pid}`);
     console.log(`logs     ${log}`);
-    console.log(`\n  roo attach ${name}`);
-    console.log(`  roo logs ${name}`);
-    console.log(`  roo stop ${name}`);
+    console.log(`\n  whiskd attach ${name}`);
+    console.log(`  whiskd logs ${name}`);
+    console.log(`  whiskd stop ${name}`);
 
     child.on("close", (code) => {
       // Live for sub-300ms failures; later deaths are caught by reconcile.
@@ -1243,13 +1243,13 @@ else if (sub === "start") {
 // ── default: foreground TUI ──
 // fg spawns exactly like `start` — detached, with the child owning the log
 // fd — then attaches to its own process. Detach is just UI teardown, and a
-// dying roo can no longer kill or silence the child (it used to own the
+// dying whiskd can no longer kill or silence the child (it used to own the
 // child's pipes). Asymmetry kept on purpose: fg sets FORCE_COLOR=1 because
 // it's a terminal view; start sets 0.
 else {
   const { name: explicitName, rest } = parseNameFlag(process.argv.slice(2));
   if (rest.length === 0) {
-    console.error("usage: roo [--name <name>] <command...>");
+    console.error("usage: whiskd [--name <name>] <command...>");
     process.exit(1);
   }
   const baseName = explicitName || deriveName(rest);
@@ -1261,7 +1261,7 @@ else {
   const log = logFile(dir);
   const logFd = openLog(log);
   const now = new Date().toISOString();
-  fs.writeSync(logFd, `[roo:${name}] started: ${cmdStr}\n[roo:${name}] time: ${now}\n[roo:${name}] ${"—".repeat(60)}\n`);
+  fs.writeSync(logFd, `[whiskd:${name}] started: ${cmdStr}\n[whiskd:${name}] time: ${now}\n[whiskd:${name}] ${"—".repeat(60)}\n`);
 
   const child = spawn(cmdStr, {
     stdio: ["ignore", logFd, logFd],
@@ -1272,10 +1272,10 @@ else {
   fs.closeSync(logFd); // the child holds its own copies
 
   child.on("error", (err) => {
-    try { fs.appendFileSync(log, `\n[roo:${name}] failed to start: ${err.message}\n`, { mode: 0o600 }); } catch {}
+    try { fs.appendFileSync(log, `\n[whiskd:${name}] failed to start: ${err.message}\n`, { mode: 0o600 }); } catch {}
     try { fs.unlinkSync(pidFile(dir)); } catch {}
     runRestores();
-    console.error(`[roo:${name}] failed to start: ${err.message}`);
+    console.error(`[whiskd:${name}] failed to start: ${err.message}`);
     process.exit(1);
   });
 
@@ -1290,17 +1290,17 @@ else {
 
     const attach = runAttach({ name, dir }, (reason) => {
       if (reason === "detached") {
-        console.log(`\n[roo:${name}] detached. still running.`);
-        console.log(`  roo attach ${name}`);
-        console.log(`  roo logs ${name}`);
-        console.log(`  roo stop ${name}`);
+        console.log(`\n[whiskd:${name}] detached. still running.`);
+        console.log(`  whiskd attach ${name}`);
+        console.log(`  whiskd logs ${name}`);
+        console.log(`  whiskd stop ${name}`);
         process.exit(0);
       }
       if (killing) {
-        console.log(`\n[roo:${name}] killed`);
+        console.log(`\n[whiskd:${name}] killed`);
         process.exit(1);
       }
-      console.log(`\n[roo:${name}] exited with code ${childCode}`);
+      console.log(`\n[whiskd:${name}] exited with code ${childCode}`);
       process.exit(childCode ?? 1);
     }, {
       onKill: () => {

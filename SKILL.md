@@ -1,32 +1,32 @@
 ---
-name: roo-process-manager
-description: Use roo to run, monitor, attach to, log, and stop long-running local processes for agents and humans. Use when starting dev servers, watchers, tunnels, background scripts, or any command that should keep running while logs remain inspectable.
+name: whiskd-process-manager
+description: Use whiskd to run, monitor, attach to, log, and stop long-running local processes for agents and humans. Use when starting dev servers, watchers, tunnels, background scripts, or any command that should keep running while logs remain inspectable.
 ---
 
-# Roo Process Manager
+# Whiskd Process Manager
 
 ## Install / run
 
 Install the skill:
 
 ```sh
-npx skills add Jeecabs/roo
+npx skills add Jeecabs/whiskd
 ```
 
 Install the CLI before use:
 
 ```sh
-git clone https://github.com/Jeecabs/roo.git
-cd roo
+git clone https://github.com/Jeecabs/whiskd.git
+cd whiskd
 ./install.sh
-roo status
+whiskd status
 ```
 
-Do not run `roo` via `npx github:Jeecabs/roo ...`. `roo` manages long-running processes and needs a stable local binary/path for reliable monitoring, attach, and stop behavior.
+Do not run `whiskd` via `npx github:Jeecabs/whiskd ...`. `whiskd` manages long-running processes and needs a stable local binary/path for reliable monitoring, attach, and stop behavior.
 
 ## Agent rules
 
-Prefer `roo` for long-running commands:
+Prefer `whiskd` for long-running commands:
 
 - dev servers: `npm run dev`, `pnpm dev`, `vite`, `next dev`
 - watchers
@@ -40,29 +40,29 @@ Use plain shell only for short commands that exit promptly.
 
 ```sh
 # Start named background process
-roo start --name api node server.js
-roo start --name dev npm run dev
-roo start --name web "npm run dev -- --host 0.0.0.0"
+whiskd start --name api node server.js
+whiskd start --name dev npm run dev
+whiskd start --name web "npm run dev -- --host 0.0.0.0"
 
 # Inspect state
-roo status
-roo status --json
-roo top
-roo top --global
+whiskd status
+whiskd status --json
+whiskd top
+whiskd top --global
 
 # Logs
-roo logs dev
-roo logs dev 100
+whiskd logs dev
+whiskd logs dev 100
 
 # Attach
-roo attach dev
+whiskd attach dev
 
 # Stop
-roo stop dev
-roo stop --all
+whiskd stop dev
+whiskd stop --all
 
 # Clean stopped state
-roo clean
+whiskd clean
 ```
 
 ## Naming guidance
@@ -74,13 +74,13 @@ Always pass `--name` for important services. Stable names make later `logs`, `at
 Separate args are fine for simple commands:
 
 ```sh
-roo start --name api node server.js
+whiskd start --name api node server.js
 ```
 
 Quote the whole command as one string when shell operators, env expansion, pipes, redirects, or `&&` are needed:
 
 ```sh
-roo start --name app "FOO=bar npm run build && npm start"
+whiskd start --name app "FOO=bar npm run build && npm start"
 ```
 
 ## Attach safety
@@ -96,9 +96,9 @@ Be careful: quitting attached sessions kills the process unless detached.
 ## Smoke test
 
 ```sh
-node --check roo
-roo status --json
-roo start --name roo-smoke "node -e 'setInterval(()=>console.log(Date.now()), 250)'"
-roo logs roo-smoke 5
-roo stop roo-smoke
+node --check whiskd
+whiskd status --json
+whiskd start --name whiskd-smoke "node -e 'setInterval(()=>console.log(Date.now()), 250)'"
+whiskd logs whiskd-smoke 5
+whiskd stop whiskd-smoke
 ```
