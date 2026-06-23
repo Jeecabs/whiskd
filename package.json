@@ -1,0 +1,23 @@
+{
+  "name": "roo-process-manager",
+  "version": "2.0.0",
+  "description": "Lightweight process wrapper with a TUI status bar for agents and humans.",
+  "bin": {
+    "roo": "./roo"
+  },
+  "scripts": {
+    "check": "node --check roo",
+    "smoke": "node --check roo && node roo status --json"
+  },
+  "keywords": [
+    "agents",
+    "process-manager",
+    "tui",
+    "logs",
+    "dev-server"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -4,17 +4,29 @@ Lightweight process wrapper with a TUI status bar. Run, background, attach, and 
 
 ## Install
 
+Install the agent skill with skills.sh:
+
 ```sh
+npx skills add Jeecabs/roo
+```
+
+Install the CLI locally to `~/bin`:
+
+```sh
+git clone https://github.com/Jeecabs/roo.git
+cd roo
 ./install.sh
 ```
 
-Copies `roo` to `~/bin`. Make sure `~/bin` is in your `PATH`:
+Make sure `~/bin` is in your `PATH`:
 
 ```sh
 export PATH=$HOME/bin:$PATH
 ```
 
-Requires Node.js.
+Requires Node.js 18+.
+
+Do not run `roo` via `npx github:Jeecabs/roo ...`. `roo` manages long-running processes and needs a stable local binary/path for reliable monitoring, attach, and stop behavior.
 
 ## Usage
 
