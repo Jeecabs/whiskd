@@ -1,8 +1,10 @@
-# whiskd
 
 <p align="center">
   <img src="assets/whiskd-logo.png" alt="whiskd tabby cat mascot" width="220">
 </p>
+
+
+# whiskd
 
 Lightweight process wrapper with a TUI status bar. Run, background, attach, and manage long-running commands with automatic log capture.
 
