@@ -1,117 +1,79 @@
 ---
 name: whiskd-process-manager
-description: Use whiskd to run, monitor, attach to, log, and stop long-running local processes for agents and humans. Use when starting dev servers, watchers, tunnels, background scripts, or any command that should keep running while logs remain inspectable.
+description: Use whiskd to start, monitor, log, and stop long-running local processes (dev servers, watchers, tunnels, background scripts) while keeping logs inspectable. Use whenever a command should keep running in the background.
 ---
 
 # Whiskd Process Manager
 
-## Install / run
+CLI for running long-running local commands in the background with captured logs.
+The commands below are all an agent needs. whiskd also has interactive TUI views
+(`attach`, `top`, bare `whiskd <cmd>`) — they block the terminal and are for humans,
+not agents. Ignore them.
 
-Install the CLI before use:
+## Default behaviour
 
-```sh
-npm install -g github:Jeecabs/whiskd
-whiskd status
-```
+- `whiskd start --name X <cmd>` is **non-blocking**: spawns the process detached and
+  returns in ~300ms. Use it for everything long-running.
+- It returns even if the command crashes on boot, so **read `logs` (or `status`) right
+  after starting** to confirm the process is actually up.
+- Use plain shell for short commands that exit on their own.
 
-After npm publish, prefer:
-
-```sh
-npm install -g whiskd
-```
-
-Install this skill separately if needed:
+## Commands
 
 ```sh
-npx skills add Jeecabs/whiskd
-```
-
-Local checkout install:
-
-```sh
-git clone https://github.com/Jeecabs/whiskd.git
-cd whiskd
-./install.sh
-whiskd status
-```
-
-Do not run `whiskd` via `npx github:Jeecabs/whiskd ...`. `whiskd` manages long-running processes and needs a stable local binary/path for reliable monitoring, attach, and stop behavior.
-
-## Agent rules
-
-Prefer `whiskd` for long-running commands:
-
-- dev servers: `npm run dev`, `pnpm dev`, `vite`, `next dev`
-- watchers
-- local APIs
-- tunnels
-- scripts where logs may matter later
-
-Use plain shell only for short commands that exit promptly.
-
-## Common commands
-
-```sh
-# Start named background process
+# Start (non-blocking). Always pass --name for anything you'll log or stop later.
 whiskd start --name api node server.js
-whiskd start --name dev npm run dev
 whiskd start --name web "npm run dev -- --host 0.0.0.0"
 
-# Inspect state
-whiskd status
-whiskd status --json
-whiskd top
-whiskd top --global
-
-# Logs
-whiskd logs dev
-whiskd logs dev 100
-
-# Attach
-whiskd attach dev
+# Inspect
+whiskd status              # table of all processes
+whiskd status --json       # machine-readable: name, status, pid, cwd, uptime, cmd, log path
+whiskd logs api            # last 40 lines  (whiskd logs api 100 for more)
 
 # Stop
-whiskd stop dev
-whiskd stop --all
+whiskd stop api
+whiskd stop --all          # only when the user asked to stop everything
 
-# Clean stopped state
+# Remove stopped-process state (not while you still need old logs)
 whiskd clean
 ```
 
-## Naming guidance
+`logs` prints and exits (no follow) — poll it again for fresh output.
 
-Always pass `--name` for important services. Stable names make later `logs`, `attach`, and `stop` safe.
+## Naming & restart
 
-## Quoting guidance
+- Without `--name`, whiskd auto-derives one from the command (`npm run dev → dev`), which
+  collides across runs. Always name important services.
+- **To restart, `stop` first.** `start --name api` while `api` is still running does NOT
+  replace it — whiskd silently starts `api-2`, and `logs api` / `stop api` keep targeting
+  the old process.
 
-Separate args are fine for simple commands:
+## Quoting
+
+Separate args are fine for simple commands. Quote the whole command as one string when you
+need shell operators — pipes, redirects, `&&`, env expansion:
 
 ```sh
 whiskd start --name api node server.js
-```
-
-Quote the whole command as one string when shell operators, env expansion, pipes, redirects, or `&&` are needed:
-
-```sh
 whiskd start --name app "FOO=bar npm run build && npm start"
 ```
 
-## Attach safety
+## Install
 
-In attached TUI sessions:
+```sh
+npm install -g github:Jeecabs/whiskd   # or: npm install -g whiskd (after publish)
+whiskd status
+```
 
-- `d` detaches and leaves process running.
-- `q` / `Ctrl+C` kills process and exits.
-- `p` pauses output.
+Don't run via `npx github:Jeecabs/whiskd ...` — whiskd manages long-running processes and
+needs a stable local binary for reliable monitoring and stop. (Skill only:
+`npx skills add Jeecabs/whiskd`.)
 
-Be careful: quitting attached sessions kills the process unless detached.
-
-## Smoke test
+## Smoke test (whiskd dev only)
 
 ```sh
 node --check whiskd
-whiskd status --json
-whiskd start --name whiskd-smoke "node -e 'setInterval(()=>console.log(Date.now()), 250)'"
+whiskd start --name whiskd-smoke "node -e 'setInterval(()=>console.log(Date.now()),250)'"
 whiskd logs whiskd-smoke 5
 whiskd stop whiskd-smoke
 ```
