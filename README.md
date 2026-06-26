@@ -140,13 +140,3 @@ Multi-argument commands are quoted per-argument, so `whiskd echo 'a  b'` preserv
 whiskd start "npm run build && npm start"   # shell operators work
 whiskd printf '%s\n' 'a b' c                # arguments survive intact
 ```
-
-## Changed in 3.0
-
-- **Renamed to `whiskd`** across the package, CLI binary, docs, agent skill, log prefixes, and state directory.
-- **State lives under `/tmp/whiskd-<uid>`**. Existing process state under older names is not read.
-
-## Changed in 2.0
-
-- **Foreground mode spawns like `start`** and attaches to its own process. The child owns its log file, so detaching — or whiskd itself being killed — leaves it running and attachable. Trade-offs: stderr is no longer tinted red, output is displayed with up to ~100ms latency, and log files now retain ANSI (stripped on display).
-- **Multi-arg commands are shell-quoted per-arg** (see above). `whiskd echo a && echo b` no longer leaks `&&` to the inner shell — quote the whole thing as one argument if you want shell semantics.
