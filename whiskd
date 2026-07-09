@@ -732,7 +732,7 @@ if (!sub || sub === "--help" || sub === "-h") {
   whiskd start <cmd...>            run in background, auto-named
   whiskd start --name api <cmd>    run in background with explicit name
   whiskd status [--json]            list all processes (--json for machine-readable)
-  whiskd top [--global]              live dashboard (--global/-g for all dirs)
+  whiskd top [--global]              live running-process dashboard (--global/-g for all dirs)
   whiskd logs [name] [n]           last n lines (default 40)
   whiskd attach [name]             attach TUI to running process
   whiskd stop [name]               stop a process (or all with --all)
@@ -904,19 +904,17 @@ else if (sub === "top") {
       const started = getStarted(p.dir);
       const startMs = started !== "?" ? new Date(started).getTime() : null;
       const pid = getPid(p.dir);
+      if (!pid) return null;
       return {
         name: p.name,
         dir: p.dir,
         cwd: p.cwd || null,
-        running: !!pid,
-        pid: pid || null,
-        uptime: pid && startMs ? formatUptime(startMs) : null,
+        running: true,
+        pid,
+        uptime: startMs ? formatUptime(startMs) : null,
         cmd: getCmd(p.dir),
       };
-    }).sort((a, b) => {
-      if (a.running !== b.running) return a.running ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
+    }).filter(Boolean).sort((a, b) => a.name.localeCompare(b.name));
   }
 
   function renderTop() {
@@ -926,12 +924,11 @@ else if (sub === "top") {
     if (procList.length === 0) topCursor = 0;
     else topCursor = Math.min(topCursor, procList.length - 1);
 
-    const runCount = procList.filter((p) => p.running).length;
     const scope = topGlobal ? " (global)" : "";
 
     process.stdout.write("\x1b[H");
 
-    const header = `whiskd top${scope} -- ${procList.length} process${procList.length !== 1 ? "es" : ""} (${runCount} running)`;
+    const header = `whiskd top${scope} -- ${procList.length} running process${procList.length !== 1 ? "es" : ""}`;
     process.stdout.write("\x1b[2K" + header + "\n");
 
     const colHeader = topGlobal
@@ -943,7 +940,7 @@ else if (sub === "top") {
 
     const availRows = rows - 4;
     if (procList.length === 0) {
-      const msg = "no processes -- whiskd start <cmd> to begin";
+      const msg = "no running processes -- whiskd start <cmd> to begin";
       const pad = Math.max(0, Math.floor((availRows - 1) / 2));
       for (let i = 0; i < availRows; i++) {
         process.stdout.write("\x1b[2K");
@@ -957,8 +954,8 @@ else if (sub === "top") {
         const p = procList[i];
         const label = (i === topCursor ? "\u25b8 " : "  ") + p.name;
         const line = topGlobal
-          ? formatColumns(label, p.running ? "running" : "stopped", p.pid ? String(p.pid) : "---", p.uptime || "---", p.cmd, cols, p.cwd || ".")
-          : formatColumns(label, p.running ? "running" : "stopped", p.pid ? String(p.pid) : "---", p.uptime || "---", p.cmd, cols);
+          ? formatColumns(label, "running", String(p.pid), p.uptime || "---", p.cmd, cols, p.cwd || ".")
+          : formatColumns(label, "running", String(p.pid), p.uptime || "---", p.cmd, cols);
         if (i === topCursor) {
           process.stdout.write("\x1b[7m" + line + "\x1b[0m");
         } else {
