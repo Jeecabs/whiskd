@@ -74,7 +74,7 @@ whiskd start --name api node server.js
 whiskd status
 whiskd status --json
 
-# Live dashboard
+# Live running-process dashboard
 whiskd top
 whiskd top --global    # all directories
 
