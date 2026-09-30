@@ -1,0 +1,18 @@
+[package]
+name = "whiskd"
+version = "5.0.0"
+edition = "2021"
+description = "Lightweight process wrapper with a TUI status bar for agents and humans."
+license = "MIT"
+repository = "https://github.com/Jeecabs/whiskd"
+keywords = ["process-manager", "tui", "logs", "agents", "dev-server"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
