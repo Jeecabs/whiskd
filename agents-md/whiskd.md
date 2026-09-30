@@ -130,6 +130,7 @@ Use after stopped processes no longer matter. Do not clean while debugging histo
 After changing the `whiskd` CLI, run focused smoke tests:
 
 ```sh
+./test.sh   # regression checks, runs in a throwaway cwd
 node --check whiskd
 whiskd status --json
 whiskd start --name whiskd-smoke "node -e 'setInterval(()=>console.log(Date.now()), 250)'"

@@ -1,17 +1,20 @@
 #!/usr/bin/env node
 
 const { spawn, spawnSync } = require("child_process");
+const crypto = require("crypto");
 const { stripVTControlCharacters: stripAnsi } = require("util");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const VERSION = "3.0.0";
+const VERSION = "4.0.0";
 
 // Per-user state dir. Deliberately /tmp, not os.tmpdir(): on macOS $TMPDIR
 // differs between GUI and SSH sessions, which would split state in two.
 const WHISKD_BASE = path.join("/tmp", "whiskd-" + (typeof process.getuid === "function" ? process.getuid() : "u"));
-const WHISKD_DIR = path.join(WHISKD_BASE, process.cwd());
+// One flat dir per cwd, named by hash: nesting the real cwd path let a proc
+// named "web" share a dir with the ./web subdirectory's procs.
+const WHISKD_DIR = path.join(WHISKD_BASE, crypto.createHash("sha256").update(process.cwd()).digest("hex").slice(0, 16));
 
 const MAX_LOG_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -103,8 +106,7 @@ function ensureBase() {
 
 function housekeep() {
   ensureBase();
-  const now = Date.now();
-  pruneOldDirs(WHISKD_BASE, now);
+  pruneOldDirs(Date.now());
 }
 
 // The parent that would have written the exit footer often exits long before
@@ -122,36 +124,29 @@ function reconcileDir(procPath) {
   markDead(path.basename(procPath), procPath, "exited (status unknown)");
 }
 
-function pruneOldDirs(dir, now) {
-  let entries;
-  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-  for (const ent of entries) {
-    const full = path.join(dir, ent.name);
-    if (!ent.isDirectory()) continue;
-    // If this dir has a "cmd" file, it's a process dir — reconcile, then check age
-    const cmd = path.join(full, "cmd");
-    if (fs.existsSync(cmd)) {
-      reconcileDir(full);
+function listDirs(dir) {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true })
+      .filter((ent) => ent.isDirectory())
+      .map((ent) => path.join(dir, ent.name));
+  } catch { return []; }
+}
+
+// Layout is <base>/<cwd-hash>/<name>/. Dirs without a cmd file (e.g. the
+// pre-4.0 nested layout) are left alone.
+function pruneOldDirs(now) {
+  for (const cwdDir of listDirs(WHISKD_BASE)) {
+    for (const procPath of listDirs(cwdDir)) {
+      if (!fs.existsSync(cmdFile(procPath))) continue;
+      reconcileDir(procPath);
       try {
-        const mtime = fs.statSync(cmd).mtimeMs;
-        if (now - mtime > MAX_AGE_MS) {
-          // Don't remove if still running
-          const pf = path.join(full, "pid");
-          if (fs.existsSync(pf)) {
-            const pid = parseInt(fs.readFileSync(pf, "utf8").trim());
-            try { process.kill(pid, 0); continue; } catch {}
-          }
-          fs.rmSync(full, { recursive: true, force: true });
+        // reconcile cleared the pid file unless the process is still alive
+        if (!fs.existsSync(pidFile(procPath)) && now - fs.statSync(cmdFile(procPath)).mtimeMs > MAX_AGE_MS) {
+          fs.rmSync(procPath, { recursive: true, force: true });
         }
       } catch {}
-    } else {
-      // Recurse into intermediate path directories
-      pruneOldDirs(full, now);
-      // Remove empty intermediate dirs
-      try {
-        if (fs.readdirSync(full).length === 0) fs.rmdirSync(full);
-      } catch {}
     }
+    try { fs.rmdirSync(cwdDir); } catch {} // only succeeds when empty
   }
 }
 
@@ -166,7 +161,11 @@ function truncateLog(logPath) {
     const text = buf.toString();
     const firstNewline = text.indexOf("\n");
     const kept = firstNewline >= 0 ? text.slice(firstNewline + 1) : text;
-    fs.writeFileSync(logPath, `[whiskd] log truncated (exceeded ${MAX_LOG_BYTES / 1024 / 1024}MB)\n` + kept, { mode: 0o600 });
+    // Truncate then append, never rewrite from offset 0: a live O_APPEND
+    // writer's lines land before or after ours instead of inside them.
+    // ponytail: lines written between the read and the truncate are lost.
+    fs.truncateSync(logPath, 0);
+    fs.appendFileSync(logPath, `[whiskd] log truncated (exceeded ${MAX_LOG_BYTES / 1024 / 1024}MB)\n` + kept);
   } catch {}
 }
 
@@ -174,19 +173,15 @@ function truncateLog(logPath) {
 
 function deriveName(cmdArgs) {
   const full = cmdArgs.join(" ");
-  // npm run <x> / yarn <x> / pnpm <x> → use the script name
-  const npmMatch = full.match(/(?:npm run|yarn|pnpm(?:\s+run)?)\s+(\S+)/);
-  if (npmMatch) return sanitize(npmMatch[1]);
-  // node/python/ruby <file> → use filename without extension
-  const fileMatch = full.match(/(?:node|python|ruby|bun|deno|go run)\s+(\S+)/);
-  if (fileMatch) return sanitize(path.basename(fileMatch[1], path.extname(fileMatch[1])));
-  // fallback: first arg that looks like a command (not a flag or single char)
-  for (const w of cmdArgs) {
-    if (!w.startsWith("-") && w.length > 1 && !/^[A-Z_]+=/.test(w)) {
-      return sanitize(path.basename(w, path.extname(w)));
-    }
-  }
-  return `proc-${Date.now().toString(36).slice(-4)}`;
+  // npm/yarn/pnpm/bun run <x> → script name; node/python/... [flags] <file>
+  // → file name; otherwise the first word that isn't a flag or env assignment.
+  const m = full.match(/\b(?:npm(?: run)?|yarn(?: run)?|pnpm(?: run)?|bun run)\s+([^-\s]\S*)/)
+    || full.match(/\b(?:node|python3?|ruby|deno run|deno|bun|go run)\s+(?:-\S+\s+)*([^-\s]\S*)/);
+  const pick = m ? m[1] : cmdArgs.find((w) => !w.startsWith("-") && w.length > 1 && !/^[A-Z_]+=/.test(w));
+  const name = pick ? sanitize(path.basename(pick, path.extname(pick))) : "";
+  if (/[a-z0-9]/.test(name)) return name;
+  // `go run .` and friends: fall back to the directory name
+  return sanitize(path.basename(process.cwd())) || `proc-${Date.now().toString(36).slice(-4)}`;
 }
 
 function sanitize(name) {
@@ -228,6 +223,7 @@ function logFile(dir) { return path.join(dir, "output.log"); }
 function pidFile(dir) { return path.join(dir, "pid"); }
 function cmdFile(dir) { return path.join(dir, "cmd"); }
 function startedFile(dir) { return path.join(dir, "started"); }
+function cwdFile(dir) { return path.join(dir, "cwd"); }
 
 function ensureProc(name) {
   const d = procDir(name);
@@ -243,6 +239,7 @@ function writeProcState(dir, pid, cmdStr, startedIso) {
     fs.writeFileSync(pidFile(dir), String(pid), { mode: 0o600 });
     fs.writeFileSync(cmdFile(dir), cmdStr, { mode: 0o600 });
     fs.writeFileSync(startedFile(dir), startedIso, { mode: 0o600 });
+    fs.writeFileSync(cwdFile(dir), process.cwd(), { mode: 0o600 });
   } catch (e) {
     die(`cannot write process state in ${dir}: ${e.message}`);
   }
@@ -389,31 +386,23 @@ function killProcs(entries, { silent = false } = {}, onDone) {
 }
 
 function allProcs() {
-  try {
-    return fs.readdirSync(WHISKD_DIR, { withFileTypes: true })
-      .filter((ent) => ent.isDirectory() && fs.existsSync(path.join(WHISKD_DIR, ent.name, "cmd")))
-      .map((ent) => ({ name: ent.name, dir: path.join(WHISKD_DIR, ent.name) }));
-  } catch { return []; }
+  return listDirs(WHISKD_DIR)
+    .filter((dir) => fs.existsSync(cmdFile(dir)))
+    .map((dir) => ({ name: path.basename(dir), dir }));
 }
 
 function allProcsGlobal() {
-  const results = [];
   const home = os.homedir();
-  function walk(dir) {
-    if (fs.existsSync(path.join(dir, "cmd"))) {
-      const name = path.basename(dir);
-      const cwdPath = path.dirname(dir).slice(WHISKD_BASE.length + 1);
-      const cwd = cwdPath.startsWith(home) ? "~" + cwdPath.slice(home.length) : "/" + cwdPath;
-      results.push({ name, dir, cwd });
-      return;
+  const results = [];
+  for (const cwdDir of listDirs(WHISKD_BASE)) {
+    for (const dir of listDirs(cwdDir)) {
+      if (!fs.existsSync(cmdFile(dir))) continue;
+      let cwd = "?";
+      try { cwd = cleanMetaText(fs.readFileSync(cwdFile(dir), "utf8")); } catch {}
+      if (cwd === home || cwd.startsWith(home + "/")) cwd = "~" + cwd.slice(home.length);
+      results.push({ name: path.basename(dir), dir, cwd });
     }
-    try {
-      for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (ent.isDirectory()) walk(path.join(dir, ent.name));
-      }
-    } catch {}
   }
-  if (fs.existsSync(WHISKD_BASE)) walk(WHISKD_BASE);
   return results;
 }
 
@@ -429,15 +418,25 @@ function uniqueName(base) {
   return `${base}-${Date.now().toString(36).slice(-4)}`;
 }
 
+// Explicit names are a contract (agents reuse them for logs/stop), so a
+// clash is an error rather than a silent `-2` suffix.
+function pickName(explicitName, cmdArgs) {
+  if (!explicitName) return uniqueName(deriveName(cmdArgs));
+  const pid = getPid(procDir(explicitName));
+  if (pid) die(`${explicitName} is already running (pid ${pid}). stop it first: whiskd stop ${explicitName}`);
+  return explicitName;
+}
+
+function exitDesc(code, signal) {
+  return code !== null ? `exited with code ${code}` : `killed by ${signal}`;
+}
+
 // ── Parse --name flag from args, return { name, rest } ──
 
+// Only a leading flag counts: a later -n belongs to the command (tail -n 3).
 function parseNameFlag(args) {
-  for (let i = 0; i < args.length; i++) {
-    if ((args[i] === "--name" || args[i] === "-n") && args[i + 1]) {
-      const name = sanitize(args[i + 1]);
-      const rest = [...args.slice(0, i), ...args.slice(i + 2)];
-      return { name, rest };
-    }
+  if ((args[0] === "--name" || args[0] === "-n") && args[1]) {
+    return { name: sanitize(args[1]), rest: args.slice(2) };
   }
   return { name: null, rest: args };
 }
@@ -479,7 +478,6 @@ function resetTerminal() {
 
 const COL_NAME_W = 16;
 const COL_DIR_W = 22;
-const COL_STATUS_W = 10;
 const COL_PID_W = 8;
 const COL_UPTIME_W = 10;
 
@@ -488,26 +486,15 @@ function truncPad(str, w, align) {
   return align === "right" ? str.padStart(w) : str.padEnd(w);
 }
 
-function formatColumns(name, status, pid, uptime, cmd, totalWidth, dir) {
+function formatColumns(name, pid, uptime, cmd, totalWidth, dir) {
   const hasDir = dir !== undefined;
-  const fixedW = COL_NAME_W + (hasDir ? COL_DIR_W + 1 : 0) + COL_STATUS_W + COL_PID_W + COL_UPTIME_W + 5;
+  const fixedW = COL_NAME_W + (hasDir ? COL_DIR_W + 1 : 0) + COL_PID_W + COL_UPTIME_W + 4;
   const cmdW = Math.max(10, totalWidth - fixedW);
   const parts = [truncPad(name, COL_NAME_W, "left")];
   if (hasDir) parts.push(truncPad(dir, COL_DIR_W, "left"));
-  parts.push(truncPad(status, COL_STATUS_W, "left"));
   parts.push(truncPad(pid, COL_PID_W, "right"));
   parts.push(truncPad(uptime, COL_UPTIME_W, "right"));
   return parts.join(" ") + "  " + truncPad(cmd, cmdW, "left");
-}
-
-function colorizeRow(line, running, hasDir) {
-  const statusStart = COL_NAME_W + 1 + (hasDir ? COL_DIR_W + 1 : 0);
-  const statusEnd = statusStart + COL_STATUS_W;
-  const before = line.slice(0, statusStart);
-  const statusText = line.slice(statusStart, statusEnd);
-  const after = line.slice(statusEnd);
-  const color = running ? "\x1b[32m" : "\x1b[2;31m";
-  return before + color + statusText + "\x1b[0m" + after;
 }
 
 // ── Resolve name: explicit arg, or pick the only running one, or error ──
@@ -731,6 +718,7 @@ if (!sub || sub === "--help" || sub === "-h") {
   whiskd <cmd...>                  run with TUI, auto-named
   whiskd start <cmd...>            run in background, auto-named
   whiskd start --name api <cmd>    run in background with explicit name
+                                   (--name/-n must come before the command)
   whiskd status [--json]            list all processes (--json for machine-readable)
   whiskd top [--global]              live running-process dashboard (--global/-g for all dirs)
   whiskd logs [name] [n]           last n lines (default 40)
@@ -760,7 +748,7 @@ Multiple processes per directory:
   whiskd start npm run build              → build
   whiskd start --name api npm run start   → api
 
-State and logs live in ${WHISKD_BASE}/<cwd>/<name>/output.log`);
+State and logs live in ${WHISKD_BASE}/<cwd-hash>/<name>/output.log`);
   process.exit(0);
 }
 
@@ -777,6 +765,7 @@ if (sub === "status") {
       const startMs = started !== "?" ? new Date(started).getTime() : null;
       return {
         name,
+        cwd: process.cwd(),
         status: pid ? "running" : "stopped",
         pid: pid || null,
         started,
@@ -854,10 +843,7 @@ else if (sub === "clean") {
     }
   }
   if (cleaned === 0) console.log("nothing to clean");
-  // Remove WHISKD_DIR if empty
-  if (fs.existsSync(WHISKD_DIR) && fs.readdirSync(WHISKD_DIR).length === 0) {
-    fs.rmSync(WHISKD_DIR, { recursive: true, force: true });
-  }
+  try { fs.rmdirSync(WHISKD_DIR); } catch {} // only succeeds when empty
   process.exit(0);
 }
 
@@ -868,7 +854,7 @@ else if (sub === "logs") {
   let n = 40;
   const args = process.argv.slice(3);
   for (const a of args) {
-    if (/^\d+$/.test(a)) n = parseInt(a);
+    if (/^\d+$/.test(a) && !fs.existsSync(cmdFile(procDir(a)))) n = parseInt(a);
     else nameArg = a;
   }
   const proc = resolveName(nameArg);
@@ -909,7 +895,6 @@ else if (sub === "top") {
         name: p.name,
         dir: p.dir,
         cwd: p.cwd || null,
-        running: true,
         pid,
         uptime: startMs ? formatUptime(startMs) : null,
         cmd: getCmd(p.dir),
@@ -932,8 +917,8 @@ else if (sub === "top") {
     process.stdout.write("\x1b[2K" + header + "\n");
 
     const colHeader = topGlobal
-      ? formatColumns("NAME", "STATUS", "PID", "UPTIME", "COMMAND", cols, "DIR")
-      : formatColumns("NAME", "STATUS", "PID", "UPTIME", "COMMAND", cols);
+      ? formatColumns("NAME", "PID", "UPTIME", "COMMAND", cols, "DIR")
+      : formatColumns("NAME", "PID", "UPTIME", "COMMAND", cols);
     process.stdout.write("\x1b[2K\x1b[1m" + colHeader + "\x1b[0m\n");
 
     process.stdout.write("\x1b[2K\n");
@@ -954,13 +939,9 @@ else if (sub === "top") {
         const p = procList[i];
         const label = (i === topCursor ? "\u25b8 " : "  ") + p.name;
         const line = topGlobal
-          ? formatColumns(label, "running", String(p.pid), p.uptime || "---", p.cmd, cols, p.cwd || ".")
-          : formatColumns(label, "running", String(p.pid), p.uptime || "---", p.cmd, cols);
-        if (i === topCursor) {
-          process.stdout.write("\x1b[7m" + line + "\x1b[0m");
-        } else {
-          process.stdout.write(colorizeRow(line, p.running, topGlobal));
-        }
+          ? formatColumns(label, String(p.pid), p.uptime || "---", p.cmd, cols, p.cwd || ".")
+          : formatColumns(label, String(p.pid), p.uptime || "---", p.cmd, cols);
+        process.stdout.write(i === topCursor ? "\x1b[7m" + line + "\x1b[0m" : line);
       }
       process.stdout.write("\n");
     }
@@ -1001,7 +982,7 @@ else if (sub === "top") {
     const prevName = procList[topCursor]?.name;
     procList = refreshProcList();
     // Keep the cap enforced while top is open (cheap: one stat per running proc).
-    for (const p of procList) if (p.running) truncateLog(logFile(p.dir));
+    for (const p of procList) truncateLog(logFile(p.dir));
     if (prevName) {
       const idx = procList.findIndex((p) => p.name === prevName);
       topCursor = idx >= 0 ? idx : Math.min(topCursor, Math.max(0, procList.length - 1));
@@ -1106,7 +1087,6 @@ else if (sub === "top") {
     if (key[0] === 0x0d || key[0] === 0x61) {
       if (procList.length === 0) return;
       const selected = procList[topCursor];
-      if (!selected.running) return;
       // Transition to attach mode
       clearInterval(topInterval);
       process.stdin.removeListener("data", topKeyHandler);
@@ -1123,7 +1103,6 @@ else if (sub === "top") {
     if (key[0] === 0x73) {
       if (procList.length === 0) return;
       const selected = procList[topCursor];
-      if (!selected.running) return;
       if (!pidIdentityOk(selected.dir, selected.pid)) {
         markDead(selected.name, selected.dir, "exited (status unknown)");
       } else {
@@ -1172,6 +1151,10 @@ else if (sub === "top") {
 
 // ── attach ──
 else if (sub === "attach") {
+  if (!process.stdin.isTTY) {
+    console.error("whiskd attach requires a terminal (use whiskd logs)");
+    process.exit(1);
+  }
   const proc = resolveName(process.argv[3]);
   if (!proc) { console.log("nothing to attach to"); process.exit(0); }
   const pid = getPid(proc.dir);
@@ -1190,8 +1173,7 @@ else if (sub === "start") {
     console.error("usage: whiskd start [--name <n>] <command...>");
     process.exit(1);
   }
-  const baseName = explicitName || deriveName(rest);
-  const name = uniqueName(baseName);
+  const name = pickName(explicitName, rest);
   ensureProc(name);
   const dir = procDir(name);
 
@@ -1228,9 +1210,13 @@ else if (sub === "start") {
     console.log(`  whiskd logs ${name}`);
     console.log(`  whiskd stop ${name}`);
 
-    child.on("close", (code) => {
-      // Live for sub-300ms failures; later deaths are caught by reconcile.
-      markDead(name, dir, `exited with code ${code}`);
+    child.on("close", (code, signal) => {
+      // Only fires for sub-300ms exits; later deaths are caught by reconcile.
+      // Surface them so callers don't mistake a boot crash for a start.
+      markDead(name, dir, exitDesc(code, signal));
+      console.error(`\n[whiskd:${name}] ${exitDesc(code, signal)} right after starting. last output:`);
+      console.error(cleanLogText(readLogTail(log)).trimEnd().split("\n").slice(-10).join("\n"));
+      process.exit(code ?? 1);
     });
 
     setTimeout(() => process.exit(0), 300);
@@ -1249,8 +1235,7 @@ else {
     console.error("usage: whiskd [--name <name>] <command...>");
     process.exit(1);
   }
-  const baseName = explicitName || deriveName(rest);
-  const name = uniqueName(baseName);
+  const name = pickName(explicitName, rest);
   ensureProc(name);
   const dir = procDir(name);
 
@@ -1282,7 +1267,8 @@ else {
     writeProcState(dir, child.pid, cmdStr, now);
 
     let killing = false;
-    let childCode = null;
+    let childCode = 1;
+    let childDesc = "";
     let escalateTimer = null;
 
     const attach = runAttach({ name, dir }, (reason) => {
@@ -1297,8 +1283,8 @@ else {
         console.log(`\n[whiskd:${name}] killed`);
         process.exit(1);
       }
-      console.log(`\n[whiskd:${name}] exited with code ${childCode}`);
-      process.exit(childCode ?? 1);
+      console.log(`\n[whiskd:${name}] ${childDesc}`);
+      process.exit(childCode);
     }, {
       onKill: () => {
         // First press SIGTERMs and schedules SIGKILL; second press escalates
@@ -1313,11 +1299,12 @@ else {
       },
     });
 
-    child.on("close", (code) => {
-      childCode = code;
+    child.on("close", (code, signal) => {
+      childCode = code ?? 128 + (os.constants.signals[signal] || 0);
+      childDesc = exitDesc(code, signal);
       if (escalateTimer) clearTimeout(escalateTimer);
       // Real exit footer; skipped if a concurrent stop already claimed it.
-      markDead(name, dir, `exited with code ${code}`);
+      markDead(name, dir, childDesc);
       attach.shutdown("exited"); // UI teardown + final drain + onReturn above
     });
   }

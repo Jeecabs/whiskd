@@ -122,11 +122,17 @@ Process names are derived from commands automatically:
 | `node server.js` | `server` |
 | `python app.py` | `app` |
 
-Use `--name` / `-n` to override.
+Use `--name` / `-n` to override. The flag must come before the command, so a later `-n` belongs to the command (`whiskd start --name t tail -n 50 app.log`). An explicit name that is already running is an error; auto-derived names get a `-2` suffix instead.
+
+## Startup failures
+
+`whiskd start` waits ~300ms. If the command exits in that window it prints the exit reason and last output, then exits with the command's code. Crashes after that are recorded in the log footer.
 
 ## Logs
 
-Logs are stored in `/tmp/whiskd-<uid>/<cwd>/<name>/output.log` (a private, per-user directory with `0700` permissions; state files and logs are `0600`).
+Logs are stored in `/tmp/whiskd-<uid>/<cwd-hash>/<name>/output.log` (a private, per-user directory with `0700` permissions; state files and logs are `0600`). Each process dir also records its `cwd`, which `status --json` and `top --global` report.
+
+Upgrading from 3.x: the state layout changed, so processes started by 3.x won't show up in 4.x. Stop them with 3.x first, or kill them by pid.
 
 Log files keep ANSI color codes; `whiskd logs` and top's log pane strip them for display, while `attach` and the foreground TUI show them raw (it's a live terminal view). The foreground TUI runs commands with `FORCE_COLOR=1`; `whiskd start` uses `FORCE_COLOR=0`.
 
