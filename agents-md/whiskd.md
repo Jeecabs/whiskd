@@ -10,25 +10,24 @@ GitHub repo: `https://github.com/Jeecabs/whiskd`
 
 Core files:
 
-- `whiskd` — Node.js CLI executable.
-- `package.json` — package metadata for local checks; do not recommend running `whiskd` through `npx`.
-- `README.md` — human usage docs.
-- `install.sh` — copies `whiskd` to `~/bin`.
+- `src/main.rs` — the whole CLI (Rust, single file, only dependency `libc`).
+- `Cargo.toml` — crate metadata; version lives here.
+- `test.sh` — integration checks against the release build.
+- `README.md` — human usage docs. `SKILL.md` — agent skill.
+- `install.sh` — builds and installs to `~/bin`.
+- `.github/workflows/` — CI (clippy, tests, test.sh) and tag-triggered release binaries.
 
 ## Install / invoke from agents
 
 Install the CLI before use:
 
 ```sh
-npm install -g github:Jeecabs/whiskd
+mkdir -p ~/bin
+curl -fsSL "https://github.com/Jeecabs/whiskd/releases/latest/download/whiskd-$(uname -m)-$(uname -s | tr A-Z a-z).tar.gz" | tar -xz -C ~/bin
 whiskd status
 ```
 
-After npm publish, prefer:
-
-```sh
-npm install -g whiskd
-```
+Or with cargo: `cargo install --git https://github.com/Jeecabs/whiskd`.
 
 Optional: install the agent skill with skills.sh:
 
@@ -44,8 +43,6 @@ cd whiskd
 ./install.sh
 whiskd status
 ```
-
-Do not run `whiskd` via `npx github:Jeecabs/whiskd ...`. `whiskd` manages long-running processes and needs a stable local binary/path for reliable monitoring, attach, and stop behavior.
 
 ## Agent workflow
 
@@ -77,6 +74,8 @@ whiskd top --global
 ```
 
 Use `whiskd status --json` when an agent needs machine-readable state. It includes names, status, cwd, pid, uptime, command, and log paths.
+
+`whiskd start` exits non-zero and prints the last output if the command dies within ~300ms.
 
 ### Read logs
 
@@ -127,28 +126,27 @@ Use after stopped processes no longer matter. Do not clean while debugging histo
 
 ## Repo development checks
 
-After changing the `whiskd` CLI, run focused smoke tests:
+After changing the CLI, run:
 
 ```sh
-./test.sh   # regression checks, runs in a throwaway cwd
-node --check whiskd
-whiskd status --json
-whiskd start --name whiskd-smoke "node -e 'setInterval(()=>console.log(Date.now()), 250)'"
-whiskd logs whiskd-smoke 5
-whiskd stop whiskd-smoke
+cargo clippy --release -- -D warnings
+cargo test --release   # unit tests for pure helpers
+./test.sh              # integration checks, runs in a throwaway cwd
 ```
 
 If testing foreground/attach behavior, avoid leaving orphan processes:
 
 ```sh
-whiskd start --name attach-smoke "node -e 'setInterval(()=>console.log("tick"), 500)'"
-whiskd attach attach-smoke
-whiskd stop attach-smoke
+W=target/release/whiskd
+$W start --name attach-smoke "while true; do echo tick; sleep 0.5; done"
+$W attach attach-smoke
+$W stop attach-smoke
 ```
 
 ## Implementation notes
 
-- State is per-user under `/tmp/whiskd-<uid>` with private permissions.
+- State is per-user under `/tmp/whiskd-<uid>/<cwd-hash>/<name>` with private permissions.
+- No daemon: every command reads state from disk; children run in their own session (`setsid`).
 - `whiskd start` stores process metadata and captures output in `output.log`.
 - Foreground `whiskd <cmd>` also spawns a managed process and attaches to it.
 - Auto-naming derives names from common commands, but agents should still prefer explicit `--name`.
