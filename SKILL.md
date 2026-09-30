@@ -63,19 +63,9 @@ whiskd start --name app "FOO=bar npm run build && npm start"
 ## Install
 
 ```sh
-npm install -g github:Jeecabs/whiskd   # or: npm install -g whiskd (after publish)
-whiskd status
+mkdir -p ~/bin
+curl -fsSL "https://github.com/Jeecabs/whiskd/releases/latest/download/whiskd-$(uname -m)-$(uname -s | tr A-Z a-z).tar.gz" | tar -xz -C ~/bin
+whiskd --version     # or: cargo install --git https://github.com/Jeecabs/whiskd
 ```
 
-Don't run via `npx github:Jeecabs/whiskd ...` — whiskd manages long-running processes and
-needs a stable local binary for reliable monitoring and stop. (Skill only:
-`npx skills add Jeecabs/whiskd`.)
-
-## Smoke test (whiskd dev only)
-
-```sh
-node --check whiskd
-whiskd start --name whiskd-smoke "node -e 'setInterval(()=>console.log(Date.now()),250)'"
-whiskd logs whiskd-smoke 5
-whiskd stop whiskd-smoke
-```
+macOS and Linux only. (Skill only: `npx skills add Jeecabs/whiskd`.)

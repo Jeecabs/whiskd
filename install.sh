@@ -1,12 +1,14 @@
 #!/bin/bash
-# Install whiskd to ~/bin
+# Build whiskd and install it to ~/bin
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$(dirname "$0")"
 DEST="$HOME/bin/whiskd"
 
+cargo build --release
 mkdir -p "$HOME/bin"
-cp "$SCRIPT_DIR/whiskd" "$DEST"
-chmod +x "$DEST"
+# install(1) writes a new file instead of overwriting in place, which would
+# invalidate the code signature of a running binary on macOS.
+install -m 755 target/release/whiskd "$DEST"
 
 echo "installed whiskd → $DEST"
