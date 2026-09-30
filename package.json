@@ -1,13 +1,16 @@
 {
   "name": "whiskd",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "description": "Lightweight process wrapper with a TUI status bar for agents and humans.",
   "bin": {
     "whiskd": "./whiskd"
   },
+  "files": [
+    "whiskd"
+  ],
   "scripts": {
     "check": "node --check whiskd",
-    "smoke": "node --check whiskd && node whiskd status --json"
+    "test": "./test.sh"
   },
   "keywords": [
     "agents",

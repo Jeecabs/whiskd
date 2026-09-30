@@ -14,7 +14,8 @@ not agents. Ignore them.
 
 - `whiskd start --name X <cmd>` is **non-blocking**: spawns the process detached and
   returns in ~300ms. Use it for everything long-running.
-- It returns even if the command crashes on boot, so **read `logs` (or `status`) right
+- If the command dies within those ~300ms, `start` prints the exit reason and last output
+  and exits non-zero. Later crashes aren't caught, so **read `logs` (or `status`) right
   after starting** to confirm the process is actually up.
 - Use plain shell for short commands that exit on their own.
 
@@ -44,9 +45,10 @@ whiskd clean
 
 - Without `--name`, whiskd auto-derives one from the command (`npm run dev → dev`), which
   collides across runs. Always name important services.
-- **To restart, `stop` first.** `start --name api` while `api` is still running does NOT
-  replace it — whiskd silently starts `api-2`, and `logs api` / `stop api` keep targeting
-  the old process.
+- **To restart, `stop` first.** `start --name api` while `api` is still running fails
+  with "already running" — it never replaces the running process.
+- `--name` / `-n` must come **before** the command; a later `-n` belongs to the command
+  (`whiskd start --name t tail -n 50 app.log`).
 
 ## Quoting
 
