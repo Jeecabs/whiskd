@@ -7,7 +7,7 @@
 
 [![CI](https://github.com/Jeecabs/whiskd/actions/workflows/ci.yml/badge.svg)](https://github.com/Jeecabs/whiskd/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Jeecabs/whiskd)](https://github.com/Jeecabs/whiskd/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial-blue.svg)](LICENSE)
 
 A tiny process wrapper for agents and humans. Start long-running commands in the background, read their logs, attach a live view, and stop them cleanly. It's a single binary with no daemon and no config. macOS and Linux.
 
@@ -74,4 +74,6 @@ Pushing a `v*` tag builds release binaries.
 
 ## License
 
-MIT
+[PolyForm Noncommercial 1.0.0](LICENSE). whiskd is free for personal, hobby, research and other non-commercial use. Using it for a business needs a commercial licence: [open an issue](https://github.com/Jeecabs/whiskd/issues) to get one.
+
+Version 5.0.0 and earlier were released under MIT and stay available under MIT.
